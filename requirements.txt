@@ -1,0 +1,29 @@
+# Core
+torch>=2.1.0            # install the CUDA build matching your GPU/driver if using --device cuda
+soundfile>=0.12.1
+numpy>=1.24
+librosa>=0.10.0
+torchaudio>=2.1.0
+torchcodec
+
+# Stage 2: source separation
+demucs>=4.0.1
+
+# Stage 3: transcription
+faster-whisper>=1.0.0
+whispermlx
+
+# Stage 4: diarization (optional, only needed with --diarize)
+pyannote.audio>=3.1.0
+
+# Stage 5: translation
+transformers>=4.40.0
+sentencepiece>=0.2.0
+indictranstoolkit
+
+# Stage 6: voice-cloned TTS
+coqui-tts             # Coqui TTS (provides XTTS-v2)
+
+# Others
+pysrt
+
