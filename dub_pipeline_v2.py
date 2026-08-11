@@ -146,6 +146,10 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import List, Optional, Dict
+import soundfile as sf
+import torch
+import numpy as np
+import librosa
 
 logging.basicConfig(
     level=logging.INFO,
@@ -205,7 +209,6 @@ def ensure_dir(p: Path) -> Path:
 
 
 def resolve_device(requested: str) -> str:
-    import torch
     if requested == "cuda" and not torch.cuda.is_available():
         log.warning("CUDA requested but unavailable, falling back to CPU")
         return "cpu"
@@ -241,21 +244,24 @@ def separate_vocals(stereo_wav: Path, workdir: Path, force: bool = False,
     vocals = out_dir / model / stereo_wav.stem / "vocals.wav"
     background = out_dir / model / stereo_wav.stem / "no_vocals.wav"
     vocals_16k = workdir / "vocals_16k_mono.wav"
-    if vocals.exists() and background.exists() and vocals_16k.exists() and not force:
-        log.info("Skipping separate_vocals (exists)")
-        return vocals, background, vocals_16k
-    ensure_dir(out_dir)
-    run([sys.executable, "-m", "demucs", "-n", model, "--two-stems", "vocals",
-         "-d", device, "-o", str(out_dir), str(stereo_wav)])
-    if not vocals.exists():
-        raise FileNotFoundError(f"Demucs did not produce expected output: {vocals}")
-    # 16kHz mono copy of the *clean* vocal stem -- used for ASR, classifiers,
-    # pitch extraction, and as the cloning reference source (cleaner than
-    # the original mixed audio, since music/fx are stripped out)
-    vocals_16k = workdir / "vocals_16k_mono.wav"
-    if not vocals_16k.exists() or force:
-        run(["ffmpeg", "-y", "-i", str(vocals), "-ac", "1", "-ar", "16000", str(vocals_16k)])
-    return vocals, background, vocals_16k
+    if not(vocals.exists() and background.exists() and vocals_16k.exists() and not force):
+        ensure_dir(out_dir)
+        run([sys.executable, "-m", "demucs", "-n", model, "--two-stems", "vocals",
+             "-d", device, "-o", str(out_dir), str(stereo_wav)])
+        if not vocals.exists():
+            raise FileNotFoundError(f"Demucs did not produce expected output: {vocals}")
+        # 16kHz mono copy of the *clean* vocal stem -- used for ASR, classifiers,
+        # pitch extraction, and as the cloning reference source (cleaner than
+        # the original mixed audio, since music/fx are stripped out)
+        vocals_16k = workdir / "vocals_16k_mono.wav"
+        if not vocals_16k.exists() or force:
+            run(["ffmpeg", "-y", "-i", str(vocals), "-ac", "1", "-ar", "16000", str(vocals_16k)])
+    # Adjust loudness
+    from pydub import AudioSegment
+    audio = AudioSegment.from_file(vocals_16k)
+    normalized_audio = audio.normalize(headroom=0.3)
+    normalized_audio.export(vocals_16k, format="wav")
+    return vocals, background, vocals_16k, audio.max
 
 # --------------------------------------------------------------------------
 # Stage 2.5: Optional subtitle processing to avoid transcription
@@ -363,54 +369,76 @@ def subs_and_diarize(vocals_16k: Path, workdir: Path, segments, force: bool = Fa
         data = json.loads(cache.read_text())
         return [Segment(**s) for s in data]
 
-    extract_segments_from_subtitles(subtitles)
     from pyannote.audio import Pipeline
     pl = Pipeline.from_pretrained(
         "pyannote/speaker-diarization-3.1", token=hf_token
     )
     diarization = pl(str(vocals_16k))
 
-    def speaker_at(t: float) -> str:
-        for turn, _, spk in diarization.speaker_diarization.itertracks(yield_label=True):
-            if turn.start <= t <= turn.end:
-                return spk
-        return "SPEAKER_default"
+    # Gender classifer
+    from transformers import pipeline
+    gender_model = "alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech"
+    gender_classifier = pipeline("audio-classification", model=gender_model)
 
     ref_dir = ensure_dir(workdir / "speaker_refs")
     audio, sr = sf.read(str(vocals_16k))
 
     new_segments: List[Segment] = []
     i = 0
-    seg = segments[i]
-    mid = (seg.start + seg.end) / 2
-    text_lang = f'text_{lang}'
+    j = 0
     for turn, _, spk in diarization.speaker_diarization.itertracks(yield_label=True):
+        log.info(f"{i},{j}, {turn.start}, {turn.end}")
         # Match segment
-        new_seg = segments[i]
-        new_seg.start = turn.start
-        new_seg.end = turn.end
-        new_seg.speaker = spk
-        new_seg.ref_audio_path = ref_path
+        ref_path = ref_dir / f"{spk}_{j}.wav"
+        new_seg = Segment(
+            index=j, start=float(turn.start), end=float(turn.end),
+            speaker=spk or "SPEAKER_00", 
+            text_en=segments[i].get("text_end", ""),
+            text_hi=segments[i].get("text_hi", ""),
+            ref_audio_path = str(ref_path), gender="Male"
+        )
 
         # Write audio
         start_sample = int(turn.start * sr)
         end_sample = int(min(turn.end, turn.start + 8.0) * sr)
+        if end_sample > len(audio):
+            new_seg.end = len(audio)/sr
+            new_segments.append(new_seg)
         clip = audio[start_sample:end_sample]
-        ref_path = ref_dir / f"{spk}_{i}.wav"
+
+        # Get gender
+        new_seg.gender = gender_classifier(clip)[0]['label']
+
         sf.write(str(ref_path), clip, sr)
 
         # Build text from sub segments
         try:
             while True:
                 i+=1
-                mid = (segments[i].start + segments[i].end) / 2
-                if turn.start <= mid <= turn.end:
-                    new_seg[text_lang] = f"{new_seg[text_lang]} {seg[text_lang]}"
-            new_segments.append(new_seg)
-        except:
+                log.info(f"{i},{j}, {segments[i]["start"]}, {segments[i]["end"]}")
+                #mid = (segments[i]["start"] + segments[i]["end"]) / 2
+                if turn.start <= segments[i]["end"]  <= turn.end:
+                    try:
+                        new_seg.text_en += f" {segments[i]["text_en"]}"
+                    except:
+                        pass
+
+                    try:
+                        new_seg.text_hi += f" {segments[i]["text_hi"]}"
+                    except:
+                        pass
+                else:
+                    log.info(new_seg)
+                    if len(new_seg.text_en) > 1 or len(new_seg.text_hi) > 1:
+                        new_segments.append(new_seg)
+                        j+=1
+                    break
+        except Exception as e:
+            log.info(e)
             break
 
-    cache.write_text(json.dumps([asdict(s) for s in segments], indent=2))
+    if new_segments:
+        cache.write_text(json.dumps([asdict(s) for s in new_segments], indent=2))
     return new_segments
 
 
@@ -424,8 +452,9 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
 
     import whispermlx
     asr_options = {
-        "temperatures" : [0.5],
-        "logprob-threshold" : -0.5
+        "temperatures" : [0.6],
+        "logprob-threshold" : -1.25,
+        #"condition_on_previous_text": False
     }
     model = whispermlx.load_model(model_size, device=device, asr_options=asr_options)
     result = model.transcribe(str(vocals_16k))
@@ -447,6 +476,11 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
         diarize_segments = diarize_model(str(vocals_16k))
         result = whispermlx.assign_word_speakers(diarize_segments, result)
 
+    from transformers import pipeline
+    gender_model = "alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech"
+    gender_classifier = pipeline("audio-classification", model=gender_model)
+    
+
     segments: List[Segment] = []
     ref_dir = ensure_dir(workdir / "speaker_refs")
     audio, sr = sf.read(str(vocals_16k))
@@ -455,22 +489,27 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
         if not text:
             continue
         speaker = seg.get("speaker")
-        ref_path = ref_dir / f"{spk}_{i}.wav"
+        ref_path = ref_dir / f"{speaker}_{i}.wav"
         if not speaker and seg.get("words"):
             # fall back to majority vote over this segment's words
             spk_counts = Counter(w.get("speaker") for w in seg["words"] if w.get("speaker"))
             speaker = spk_counts.most_common(1)[0][0] if spk_counts else "SPEAKER_00"
 
-        # Write audio
-        start_sample = int(seg.start * sr)
-        end_sample = int(min(seg.end, seg.start + 8.0) * sr)
+        # Audio clip
+        start_sample = int(seg["start"] * sr)
+        end_sample = int(min(seg["end"], seg["start"] + 8.0) * sr)
         clip = audio[start_sample:end_sample]
+
+        # Get gender
+        results = gender_classifier(clip)
+
+        # Write audio
         sf.write(str(ref_path), clip, sr)
         # Finalized segment
         segments.append(Segment(
             index=i, start=float(seg["start"]), end=float(seg["end"]),
             speaker=speaker or "SPEAKER_00", text_en=text,
-            ref_audio_path = ref_path
+            ref_audio_path = str(ref_path), gender=results[0]['label']
         ))
 
 
@@ -485,7 +524,6 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
 # --------------------------------------------------------------------------
 
 def _load_age_gender_model(device: str):
-    import torch
     import torch.nn as nn
     from transformers import Wav2Vec2Processor
     from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2Model, Wav2Vec2PreTrainedModel
@@ -510,6 +548,7 @@ def _load_age_gender_model(device: str):
             self.age = ModelHead(config, 1)
             self.gender = ModelHead(config, 3)
             self.init_weights()
+            self.post_init()
 
         def forward(self, input_values):
             hidden_states = self.wav2vec2(input_values)[0]
@@ -523,12 +562,18 @@ def _load_age_gender_model(device: str):
     model = AgeGenderModel.from_pretrained(name).to(device).eval()
     return processor, model
 
+def classify_gender(segments):
+    # 1. Load the audio file and automatically resample to 16kHz
+    speech, sample_rate = librosa.load(audio_path, sr=16000)
+    
+    # 2. Initialize the audio classification pipeline
+    # We use a specialized fine-tuned wav2vec2 model for gender classification
+    
+    return predictions
 
 def classify_age_gender(segments: List[Segment], vocals_16k: Path, workdir: Path,
                           force: bool = False, device: str = "cpu") -> List[Segment]:
     import numpy as np
-    import soundfile as sf
-    import torch
 
     cache = workdir / "age_gender.json"
     if cache.exists() and not force:
@@ -554,6 +599,7 @@ def classify_age_gender(segments: List[Segment], vocals_16k: Path, workdir: Path
             _, logits_age, logits_gender = model(input_values)
         seg.age_years = int(logits_age.cpu().numpy().squeeze()*10) * 10.0
         seg.gender = gender_labels[int(np.argmax(logits_gender.cpu().numpy()))]
+        log.info(f"{seg.gender} : {seg.text_en}")
         results.append({"index": seg.index, "gender": seg.gender, "age_years": seg.age_years})
 
     cache.write_text(json.dumps(results, indent=2))
@@ -582,14 +628,15 @@ def classify_emotion(segments: List[Segment], vocals_16k: Path, workdir: Path,
                 seg.dominance = cached[seg.index].get("dominance")
         return segments
 
-    import soundfile as sf
     audio, sr = sf.read(str(vocals_16k))
     results = []
 
     if backend == "categorical":
         from transformers import pipeline
-        clf = pipeline("audio-classification", model="superb/wav2vec2-base-superb-er", device=device if device != "mps" else -1)
-        label_map = {"neu": "neutral", "hap": "happy", "ang": "angry", "sad": "sad"}
+        #clf = pipeline("audio-classification", model="superb/wav2vec2-base-superb-er", device=device if device != "mps" else -1)
+        #label_map = {"neu": "neutral", "hap": "happy", "ang": "angry", "sad": "sad"}
+        clf = pipeline("audio-classification", model="ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition", device=device if device != "mps" else -1)
+        label_map = {v:v for v in ['angry', 'calm', 'disgust', 'fearful', 'happy', 'neutral', 'sad', 'surprised']}
         for seg in segments:
             chunk = audio[int(seg.start * sr):int(seg.end * sr)]
             if len(chunk) < sr * 0.3:
@@ -599,7 +646,6 @@ def classify_emotion(segments: List[Segment], vocals_16k: Path, workdir: Path,
             seg.emotion = label_map.get(raw_label, raw_label)
             results.append({"index": seg.index, "emotion": seg.emotion})
     else:
-        import torch
         import torch.nn as nn
         from transformers import Wav2Vec2Processor
         from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2Model, Wav2Vec2PreTrainedModel
@@ -629,8 +675,7 @@ def classify_emotion(segments: List[Segment], vocals_16k: Path, workdir: Path,
                 pooled = torch.mean(hidden_states, dim=1)
                 return pooled, self.classifier(pooled)
 
-        #name = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
-        name="ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition"
+        name = "audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim"
         processor = Wav2Vec2Processor.from_pretrained(name)
         model = EmotionModel.from_pretrained(name).to(device).eval()
 
@@ -665,9 +710,6 @@ def classify_emotion(segments: List[Segment], vocals_16k: Path, workdir: Path,
 # --------------------------------------------------------------------------
 
 def extract_pitch_and_speed(segments: List[Segment], vocals_16k: Path) -> List[Segment]:
-    import librosa
-    import soundfile as sf
-    import numpy as np
 
     audio, sr = sf.read(str(vocals_16k))
     for seg in segments:
@@ -709,7 +751,6 @@ def translate_indictrans2(segments: List[Segment], workdir: Path, force: bool = 
                 seg.text_hi = cached[seg.index]
             return segments
 
-    import torch
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
     from IndicTransToolkit.processor import IndicProcessor
 
@@ -753,7 +794,6 @@ def translate_nllb(segments: List[Segment], workdir: Path, force: bool = False,
                 seg.text_hi = cached[seg.index]
             return segments
 
-    import torch
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     model_name = "facebook/nllb-200-distilled-600M"
@@ -767,6 +807,78 @@ def translate_nllb(segments: List[Segment], workdir: Path, force: bool = False,
         seg.text_hi = tok.batch_decode(generated, skip_special_tokens=True)[0].strip()
 
     cache.write_text(json.dumps([{"index": s.index, "text_hi": s.text_hi} for s in segments], indent=2))
+    return segments
+
+def translate_sarvam(segments: List[Segment], workdir: Path, force: bool = False,
+                     device: str = "cpu", tgt_lang = "Hindi", model_name = "sarvamai/sarvam-translate") -> List[Segment]:
+    """Fallback translator if IndicTransToolkit isn't installed."""
+    cache = workdir / "translated.json"
+    if cache.exists() and not force:
+        cached = {s["index"]: (s["text_hi"], s["start"], s["end"]) for s in json.loads(cache.read_text())}
+        if all(seg.index in cached for seg in segments):
+            for seg in segments:
+                seg.text_hi = cached[seg.index][0]
+                seg.start = cached[seg.index][1]
+                seg.end = cached[seg.index][2]
+            return segments
+
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    import re
+
+    # Load tokenizer and model
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
+
+    # Generate the output
+    texts = []
+    out = []
+    thresh = 30
+    i = 0
+    text = ''
+    for seg in segments:
+        text += f'<{seg.gender}>{seg.text_en}|'
+        i+=1
+        if i%thresh == 0:
+            texts.append(text[:-1])
+            text = f'<{seg.gender}>{seg.text_en}|'
+            i = 0
+            continue
+    if i!= 0:
+        texts.append(text[:-1])
+    for text in texts:
+        messages = [
+            {"role": "system", "content": f"Translate the text below to {tgt_lang}. Each text section is preceded by |(Male/Female). Use surrounding text as context."},
+            {"role": "user", "content": text}
+        ]
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+        generated_ids = model.generate(
+            **model_inputs,
+            max_new_tokens=1024,
+            do_sample=True,
+            temperature=0.01,
+            num_return_sequences=1
+        )
+        output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
+        output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
+        log.info(f"Pairs : {text}, {output_text}")
+        output_text = re.sub(r'<[^>]*>', '', output_text) # remove model output tags
+        output_text = re.sub(r'([^)]*)', '', output_text) # remove model output tags
+        log.info(f"Pairs : {text}, {output_text}")
+        temp = output_text.split('|')
+        out.extend(temp[:thresh-1])
+    if len(temp) > thresh :
+        out.append(temp[thresh]) # last element
+    log.info(f"Length {len(segments)}, {len(out)}")
+    for i, t in enumerate(out[:len(segments)]):
+        segments[i].text_hi = t
+
+    cache.write_text(json.dumps([{"index": s.index, "text_hi": s.text_hi, 
+                              "start":s.start, "end":s.end} for s in segments], indent=2))
     return segments
 
 
@@ -789,8 +901,10 @@ HINDI_PARLER_PRESETS = {
 def build_speaker_profiles(segments: List[Segment], workdir: Path,
                              override_path: Optional[Path] = None) -> Dict[str, SpeakerProfile]:
     by_speaker: Dict[str, List[Segment]] = defaultdict(list)
+    samples: Dict[str, List[str]] = defaultdict(list)
     for seg in segments:
         by_speaker[seg.speaker].append(seg)
+        samples[seg.speaker].append(seg.ref_audio_path)
 
     overrides = {}
     if override_path and override_path.exists():
@@ -811,10 +925,6 @@ def build_speaker_profiles(segments: List[Segment], workdir: Path,
         speeds = [s.speed_wps for s in segs if s.speed_wps]
         mean_speed = sum(speeds) / len(speeds) if speeds else 2.5
 
-        samples = []
-        for seg in segs:
-            samples = seg.ref
-
         if speaker_id in overrides and "parler_preset" in overrides[speaker_id]:
             preset = overrides[speaker_id]["parler_preset"]
         else:
@@ -825,7 +935,7 @@ def build_speaker_profiles(segments: List[Segment], workdir: Path,
         profiles[speaker_id] = SpeakerProfile(
             speaker_id=speaker_id, gender=gender, age_years=mean_age,
             dominant_emotion=dominant_emotion, mean_pitch_hz=mean_pitch,
-            mean_speed_wps=mean_speed, parler_preset=preset, samples = []
+            mean_speed_wps=mean_speed, parler_preset=preset,
         )
         log.info("Speaker %s -> gender=%s age=%.0f emotion=%s preset=%s (%d segments)",
                   speaker_id, gender, mean_age, dominant_emotion, preset, len(segs))
@@ -861,12 +971,14 @@ def build_parler_description(seg: Segment, profile: SpeakerProfile) -> str:
 # Voice clone profiles
 def build_speaker_ref_profiles(segments: List[Segment], workdir: Path,
                              override_path: Optional[Path] = None) -> Dict[str, SpeakerProfile]:
+    import librosa
     profiles: Dict[str, List[str]] = defaultdict(list)
     for seg in segments:
-        profiles[seg.speaker].append(seg.ref_audio_path)
+        if librosa.get_duration(path = seg.ref_audio_path) > 5.0:
+            profiles[seg.speaker].append(str(seg.ref_audio_path))
 
     (workdir / "speaker_profiles.json").write_text(
-        json.dumps({k: asdict(v) for k, v in profiles.items()}, indent=2, ensure_ascii=False)
+        json.dumps({k: v for k, v in profiles.items()}, indent=2, ensure_ascii=False)
     )
     return profiles
 
@@ -876,8 +988,6 @@ def build_speaker_ref_profiles(segments: List[Segment], workdir: Path,
 
 def synth_parler(segments: List[Segment], profiles: Dict[str, SpeakerProfile],
                    workdir: Path, force: bool = False, device: str = "cpu") -> List[Segment]:
-    import torch
-    import soundfile as sf
     from parler_tts import ParlerTTSForConditionalGeneration
     from transformers import AutoTokenizer
 
@@ -920,9 +1030,6 @@ def build_clone_references(segments: List[Segment], vocals_16k: Path, workdir: P
     the clone lean more heavily on English phonetic/prosodic patterns;
     short clips (~3-6s) still carry pitch/timbre/cadence without as much
     English-specific articulation for the model to imitate."""
-    import librosa
-    import soundfile as sf
-
     ref_dir = ensure_dir(workdir / "clone_refs")
     audio, sr = sf.read(str(vocals_16k))
 
@@ -949,10 +1056,7 @@ def build_clone_references(segments: List[Segment], vocals_16k: Path, workdir: P
 
 
 def synth_clone_indicf5(segments: List[Segment], workdir: Path, force: bool = False) -> List[Segment]:
-    import numpy as np
-    import soundfile as sf
     from transformers import AutoModel
-
     out_dir = ensure_dir(workdir / "tts_clone")
     model = AutoModel.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True)
 
@@ -982,12 +1086,12 @@ def synth_clone_indicf5(segments: List[Segment], workdir: Path, force: bool = Fa
 # --------------------------------------------------------------------------
 # Stage 7b: TTS Method B -- XTTS voice cloning (few shot)
 # --------------------------------------------------------------------------
-def synth_coqui(segments: List[Segment], profiles: Dict[str, SpeakerProfile],
-                gpt_cond_len = 30,
-               workdir: Path, force: bool = False, device: str = "cpu") -> List[Segment]:
-    import random
+def synth_coqui(segments: List[Segment], profiles: Dict[str, List[str]],
+                workdir: Path, gpt_cond_len = 30,
+                force: bool = False, device: str = "cpu") -> List[Segment]:
+    import shutil
     from TTS.api import TTS
-    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", device=device)
+    tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
     tts_dir = ensure_dir(workdir / "tts_raw")
     for seg in segments:
         out_path = tts_dir / f"seg_{seg.index:04d}.wav"
@@ -997,11 +1101,27 @@ def synth_coqui(segments: List[Segment], profiles: Dict[str, SpeakerProfile],
         if not seg.ref_audio_path:
             log.warning("No reference audio for segment %s, skipping", seg.index)
             continue
-        tts.tts_to_file(text=seg.text_hi,
-                file_path=seg.tts_audio_path,
-                speaker_wav=random.sample(profiles[seg.speaker], k=6),
-                language="hi",
-                gpt_cond_len = gpt_cond_len)
+        if len(seg.text_en) < 11:# or len(profiles[seg.speaker]) == 0:
+            shutil.copy(seg.ref_audio_path, out_path)
+        else:
+            if profiles[seg.speaker] and len(profiles[seg.speaker]) > 0:
+                refs = [seg.ref_audio_path] + list(np.random.choice(profiles[seg.speaker], size=3, replace=True))
+            else:
+                refs = seg.ref_audio_path
+            try:
+                tts.tts_to_file(text=seg.text_hi,
+                        file_path=out_path,
+                        speaker_wav=refs,
+                        language="hi",
+                        gpt_cond_len = gpt_cond_len)
+            except:
+                shutil.copy(seg.ref_audio_path, out_path)
+                #tts.tts_to_file(text=seg.text_hi[:20],
+                #        file_path=out_path,
+                #        speaker_wav=seg.ref_audio_path,
+                #        language="hi",
+                #        gpt_cond_len = gpt_cond_len)
+        seg.tts_audio_path = str(out_path)
     return segments
 
 # --------------------------------------------------------------------------
@@ -1009,7 +1129,6 @@ def synth_coqui(segments: List[Segment], profiles: Dict[str, SpeakerProfile],
 # --------------------------------------------------------------------------
 
 def get_duration(wav_path: Path) -> float:
-    import soundfile as sf
     info = sf.info(str(wav_path))
     return info.frames / info.samplerate
 
@@ -1048,9 +1167,6 @@ def align_segments(segments: List[Segment], workdir: Path, force: bool = False,
 
 def build_hindi_vocal_track(segments: List[Segment], total_duration: float, workdir: Path,
                               sample_rate: int = 48000, fade_ms: float = 15.0) -> Path:
-    import numpy as np
-    import soundfile as sf
-
     out_path = workdir / "hindi_vocals_full.wav"
     canvas = np.zeros((int(total_duration * sample_rate) + sample_rate, 2), dtype=np.float32)
     fade_samples = int(sample_rate * fade_ms / 1000.0)
@@ -1081,10 +1197,24 @@ def build_hindi_vocal_track(segments: List[Segment], total_duration: float, work
     sf.write(str(out_path), canvas, sample_rate)
     return out_path
 
+def int16_to_dbfs(sample_value):
+    # Handle absolute silence to avoid math domain error
+    if sample_value == 0:
+        return float('-inf')
+    # 32768 is the maximum absolute value for a signed 16-bit integer
+    max_val = 32768.0
+    # Calculate decibels relative to full scale (dBFS)
+    dbfs = 20 * math.log10(abs(sample_value) / max_val)
+    return dbfs
 
-def loudness_match_and_mix(hindi_vocals: Path, background: Path, workdir: Path) -> Path:
+def loudness_match_and_mix(hindi_vocals: Path, background: Path, workdir: Path, volume) -> Path:
     normalized = workdir / "hindi_vocals_normalized.wav"
-    run(["ffmpeg", "-y", "-i", str(hindi_vocals), "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", str(normalized)])
+    run(["ffmpeg", "-y", "-i", str(hindi_vocals), "-af", f"loudnorm=I=-16:TP={int16_to_dbfs(volume)}:LRA=11", str(normalized)])
+    #from pydub import AudioSegment
+    #audio = AudioSegment.from_file(normalized)
+    #change_in_dBFS = volume - audio.dBFS
+    #normalized_audio = audio.apply_gain(change_in_dbFS)
+    #normalized_audio.export(normalized, format="wav")
     mixed = workdir / "final_hindi_track.wav"
     run(["ffmpeg", "-y", "-i", str(normalized), "-i", str(background),
          "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0", str(mixed)])
@@ -1140,11 +1270,11 @@ def main():
                      help="skip wav2vec2 age/gender classification; falls back to a pitch-threshold gender guess")
     ap.add_argument("--no-detect-emotion", action="store_true",
                      help="skip emotion classification; defaults every segment to 'neutral'")
-    ap.add_argument("--emotion-backend", default="dimensional", choices=["categorical", "dimensional"])
+    ap.add_argument("--emotion-backend", default="categorical", choices=["categorical", "dimensional"])
 
-    ap.add_argument("--translator", default="indictrans2", choices=["indictrans2", "nllb"])
+    ap.add_argument("--translator", default="indictrans2", choices=["indictrans2", "nllb", "gemma", "sarvam"])
 
-    ap.add_argument("--tts-method", required=True, choices=["parler", "clone"])
+    ap.add_argument("--tts-method", required=True, choices=["parler", "clone", 'coqui'])
     ap.add_argument("--speaker-overrides", type=Path, default=None,
                      help="JSON: {\"SPEAKER_00\": {\"parler_preset\": \"Rohit\"}} to manually pin presets")
     ap.add_argument("--f5-ref-max-seconds", type=float, default=6.0)
@@ -1159,6 +1289,7 @@ def main():
 
 
     sub = None
+    segments=None
     need_translate = True
     lang = args.target_lang
     if args.subtitle_file:
@@ -1171,10 +1302,9 @@ def main():
         else:
             need_translate = False
         segments = read_subs_as_whisper_segments(sub_file, lang)
-    log.info(segments)
 
     stereo_wav, _mono_unused = extract_audio(args.input, workdir, force=args.force)
-    vocals_wav, background_wav, vocals_16k = separate_vocals(
+    vocals_wav, background_wav, vocals_16k, vol = separate_vocals(
         stereo_wav, workdir, force=args.force, device=device, model=args.demucs_model
     )
 
@@ -1184,7 +1314,8 @@ def main():
             vocals_16k, workdir, segments, force=args.force, model_size=args.whisper_model,
             device=device, diarize=not args.no_diarize, hf_token=args.hf_token,
         )
-    else:
+
+    if not segments:
         # Subtitle pipeline failed, transcribe instead
         segments = transcribe_and_diarize(
             vocals_16k, workdir, force=args.force, model_size=args.whisper_model,
@@ -1195,6 +1326,9 @@ def main():
         log.error("No speech detected -- aborting.")
         sys.exit(1)
 
+    #if not args.no_detect_age_gender:
+    #    segments = classify_age_gender(segments, vocals_16k, workdir, force=args.force, device=device)
+
     if need_translate:
         if args.translator == "indictrans2":
             try:
@@ -1202,14 +1336,17 @@ def main():
             except ImportError as e:
                 log.warning("IndicTransToolkit unavailable (%s); falling back to NLLB", e)
                 segments = translate_nllb(segments, workdir, force=args.force, device=device)
-        else:
+        elif args.translator == "nllb":
             segments = translate_nllb(segments, workdir, force=args.force, device=device)
+        elif args.translator == "gemma":
+            segments = translate_sarvam(segments, workdir, force=args.force, device=device, model_name="google/translategemma-4b-it")
+        else:
+            segments = translate_sarvam(segments, workdir, force=args.force, device=device)
 
+        for seg in segments:
+            print(seg.text_en, seg.text_hi)
 
-    print(segments[:10])
     if args.tts_method == "parler":
-        if not args.no_detect_age_gender:
-            segments = classify_age_gender(segments, vocals_16k, workdir, force=args.force, device=device)
         if not args.no_detect_emotion:
             segments = classify_emotion(segments, vocals_16k, workdir, force=args.force,
                                           device=device, backend=args.emotion_backend)
@@ -1225,8 +1362,8 @@ def main():
         profiles = build_speaker_ref_profiles(segments, workdir, override_path=args.speaker_overrides)
 
         if args.tts_method == "clone":
-            #segments = build_clone_references(segments, vocals_16k, workdir,
-            #                                    ref_max_seconds=args.f5_ref_max_seconds)
+            segments = build_clone_references(segments, vocals_16k, workdir,
+                                                ref_max_seconds=args.f5_ref_max_seconds)
             segments = synth_clone_indicf5(segments, workdir, force=args.force)
         elif args.tts_method == "coqui":
             segments = synth_coqui(segments, profiles, workdir, force=args.force, device=device)
@@ -1235,7 +1372,7 @@ def main():
 
     total_duration = get_media_duration(args.input)
     hindi_vocals_full = build_hindi_vocal_track(segments, total_duration, workdir)
-    final_hindi_track = loudness_match_and_mix(hindi_vocals_full, background_wav, workdir)
+    final_hindi_track = loudness_match_and_mix(hindi_vocals_full, background_wav, workdir, vol)
 
     mux_into_video(args.input, final_hindi_track, args.output)
     log.info("Done. Output: %s", args.output.resolve())
