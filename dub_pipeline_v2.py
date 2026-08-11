@@ -836,18 +836,18 @@ def translate_sarvam(segments: List[Segment], workdir: Path, force: bool = False
     i = 0
     text = ''
     for seg in segments:
-        text += f'<{seg.gender}>{seg.text_en}|'
+        text += f'({seg.gender}) {seg.text_en}'
         i+=1
         if i%thresh == 0:
             texts.append(text[:-1])
-            text = f'<{seg.gender}>{seg.text_en}|'
+            text = f'({seg.gender}) {seg.text_en}'
             i = 0
             continue
     if i!= 0:
         texts.append(text[:-1])
     for text in texts:
         messages = [
-            {"role": "system", "content": f"Translate the text below to {tgt_lang}. Each text section is preceded by |(Male/Female). Use surrounding text as context."},
+            {"role": "system", "content": f"Translate the text below to {tgt_lang}. Each phrase is preceded by speaker's gender descriptor (Male/Female). Use surrounding text as context."},
             {"role": "user", "content": text}
         ]
         text = tokenizer.apply_chat_template(
@@ -867,7 +867,7 @@ def translate_sarvam(segments: List[Segment], workdir: Path, force: bool = False
         output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
         log.info(f"Pairs : {text}, {output_text}")
         output_text = re.sub(r'<[^>]*>', '', output_text) # remove model output tags
-        output_text = re.sub(r'([^)]*)', '', output_text) # remove model output tags
+        output_text = re.sub(r'([^)]*)', '|', output_text) # remove model output tags
         log.info(f"Pairs : {text}, {output_text}")
         temp = output_text.split('|')
         out.extend(temp[:thresh-1])
