@@ -1,7 +1,6 @@
 # Experimental Modular Voice Dubbing for Shows & Movies
 An End-to-end voice dubbing tool. For a chosen video, the tool translat
 
-
 **PLEASE NOTE** : I will not be uploading any speech clips, for privacy and as a good practice.
 Please acquire speech clips and place them in speakers/male and speakers/female directories. 
 I will soon add support for generating these reference clips. For best results, it is better
@@ -10,7 +9,7 @@ to use voices of the speakers already in the voice models used.
 The requirements are intentionally incomplete. What's provided works, while the other options need
 understanding what you are doing. You can also add finetuned models yourselves, for your hardware.
 
-## Current Features
+## Current Features (v0)
 - VAD, whisper mlx, diarization
 - Speech to speech translation - Seamless M4T + ChatterboxVC
 - Text translation (nllb, gemma, sarvam, indictrans2)
@@ -29,6 +28,8 @@ understanding what you are doing. You can also add finetuned models yourselves, 
 - Prosody transfer (open problem)
 - Scripts for model/library setup
 - Multilingual dubbing
+- Test audio examples for reference
+- Widget / GUI for audio comparison
 
 
 # Video Dubbing Pipeline
@@ -109,9 +110,7 @@ audio.wav ──────────────► Demucs ──► vocals.
 ## Setup
 
 ```bash
-# system dependency
-
-# Download tool
+# Download
 git clone https://github.com/writer-in-fancy-pants/audio_dubbing
 cd audio_dubbing
 
@@ -153,7 +152,7 @@ python dub_pipeline_v2.py \
 
 ### Whisper (with diarization) -> SeamlessM4T -> ChatterboxVC
 Diarization is highly recommended, though it takes some time. The output without diarization has been found monotonous.
-```
+```bash
 python ./dub_pipeline_direct_s2st.py \
   --input ./output.mkv \
   --output ./output_dubbed.mkv \
