@@ -338,8 +338,8 @@ def build_speaker_reference(vocals_wav: Path, segments: List[Segment], workdir: 
 # --------------------------------------------------------------------------
 
 SPEAKER_MAPPING={
-    "male": [1, 4, 5, 6, 8, 12, 19, 24, 25, 26, 27, 29, 30],
-    "female": [0, 2, 3, 4, 9, 13, 14, 15, 16, 17, 18]
+    "male": [58, 46, 33, 1, 51, 4, 5, 6, 8, 12, 19, 24, 25, 26, 27, 29, 30],
+    "female": [44, 175, 43, 39, 2, 3, 9, 13, 14, 15, 16, 17, 18]
 }
 
 def direct_s2st(vocals_wav: Path, segments: List[Segment], workdir: Path,
@@ -412,7 +412,7 @@ def voice_style_transfer(segments: List[Segment], workdir: Path, force: bool = F
     converter.load_ckpt(f"{checkpoint_dir}/checkpoint.pth")
 
     # cache target-speaker embeddings per unique reference clip
-    target_se_cache = {}
+    # target_se_cache = {}
     for seg in segments:
         if not seg.s2st_audio_path:
             continue
@@ -425,17 +425,17 @@ def voice_style_transfer(segments: List[Segment], workdir: Path, force: bool = F
             seg.styled_audio_path = seg.s2st_audio_path
             continue
 
-        if seg.ref_audio_path not in target_se_cache:
-            target_se, _ = se_extractor.get_se(seg.ref_audio_path, converter, vad=False)
-            target_se_cache[seg.ref_audio_path] = target_se
-        target_se = target_se_cache[seg.ref_audio_path]
+        # if seg.ref_audio_path not in target_se_cache:
+        #     target_se, _ = se_extractor.get_se(seg.ref_audio_path, converter, vad=False)
+        #     target_se_cache[seg.ref_audio_path] = target_se
+        # target_se = target_se_cache[seg.ref_audio_path]
 
         source_se, _ = se_extractor.get_se(seg.s2st_audio_path, converter, vad=False)
 
         converter.convert(
             audio_src_path=seg.s2st_audio_path,
             src_se=source_se,
-            tgt_se=target_se,
+            tgt_se=seg.ref_audio_path,
             output_path=str(out_path),
         )
         seg.styled_audio_path = str(out_path)
@@ -463,9 +463,12 @@ def voice_style_transfer_chatterbox(segments: List[Segment], workdir: Path,
             seg.styled_audio_path = seg.s2st_audio_path
             continue
 
+        speaker_id = SPEAKER_MAPPING[seg.gender.lower()][int(seg.speaker.split('_')[-1])]
+
         arr = voice_model.generate(
             seg.s2st_audio_path,
-            seg.ref_audio_path,
+            Path("./seamless_outputs") / f"seg_0348_spk_{speaker_id}_{seg.gender}.wav"
+            #seg.ref_audio_path,
         )
         log.info(f"{voice_model.sr} {arr.shape}")
         torchaudio.save(out_path, arr, voice_model.sr)
@@ -614,7 +617,7 @@ def main():
                      help="path to downloaded OpenVoice V2 checkpoint directory")
     ap.add_argument("--max-segment-len", type=float, default=12.0,
                      help="max seconds per VAD-detected chunk fed to S2ST")
-    ap.add_argument("--vc", default="openvoice", choices=["openvoice", "chatterbox"])
+    ap.add_argument("--vc", default="chatterbox", choices=["openvoice", "chatterbox"])
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
