@@ -107,7 +107,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("dub_pipeline_direct_s2st")
 
-
 # --------------------------------------------------------------------------
 # Data model
 # --------------------------------------------------------------------------
@@ -140,7 +139,6 @@ def ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
 
-
 def resolve_device(requested: str) -> str:
     if requested == "cuda" and not torch.cuda.is_available():
         log.warning("CUDA requested but not available, falling back to CPU")
@@ -150,6 +148,20 @@ def resolve_device(requested: str) -> str:
         return "cpu"
     return requested
 
+def get_audio_files_in_dir(loc:Path)-> List[Path]:
+    audio_extensions = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
+    # Get all audio files recursively
+    return sorted([
+        file for file in loc.rglob("*") 
+        if file.is_file() and file.suffix.lower() in audio_extensions
+    ])
+
+def get_speaker_mapping(speakers_dir = Path("./speakers")):
+    speaker_mapping = {}
+    for spk_cls in speakers_dir.iterdir():
+        if spk_cls.is_dir():
+            speaker_mapping[spk_cls.name.lower()]  = get_audio_files_in_dir(spk_cls)
+    return speaker_mapping
 
 # --------------------------------------------------------------------------
 # Stage 1: extract audio
@@ -302,9 +314,9 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
 
         # Reference voice id
         try:
-            speaker_id = SPEAKER_MAPPING[gender][int(speaker.split('_')[-1])]
+            speaker_id = int(speaker.split('_')[-1])
         except:
-            speaker_id = SPEAKER_MAPPING[gender][-1]
+            speaker_id = -1
 
         # Write audio
         sf.write(str(ref_path), clip, sr)
@@ -321,34 +333,21 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
     return segments
 
 
-def build_speaker_reference(vocals_wav: Path, segments: List[Segment], workdir: Path) -> List[Segment]:
-    """All segments share one reference clip (the longest segment) so the
-    voice style transfer stage has consistent timbre to target. Swap this
-    for per-speaker diarization + per-speaker refs if you need multiple
-    distinct cloned voices."""
-
-    # ref_dir = ensure_dir(workdir / "speaker_refs")
-    # longest = max(segments, key=lambda s: s.end - s.start)
-    # audio, sr = sf.read(str(vocals_wav))
-    # start_sample = int(longest.start * sr)
-    # end_sample = int(min(longest.end, longest.start + 8.0) * sr)
-    # ref_path = ref_dir / "SPEAKER_default.wav"
-    # sf.write(str(ref_path), audio[start_sample:end_sample], sr)
-
-    # reference speaker
+def build_speaker_reference(segments: List[Segment], spk_map = {}) -> List[Segment]:
+    """Speaker references."""
     for seg in segments:
-        seg.ref_audio_path = Path("./seamless_outputs") / f"seg_0348_spk_{seg.speaker}_{seg.gender}.wav"
+        try:
+            # If speaker examples provided, loops over the available voices for different speakers
+            seg.ref_audio_path = spk_map[seg.gender][seg.speaker % len(spk_map[seg.gender])]
+        except:
+            # Keep the original audio as speaker reference
+            pass
     return segments
 
 
 # --------------------------------------------------------------------------
 # Stage 4: DIRECT speech-to-speech translation (SeamlessM4T-v2)
 # --------------------------------------------------------------------------
-
-SPEAKER_MAPPING={
-    "male": [58, 46, 33, 1, 51, 4, 5, 6, 8, 12, 19, 24, 25, 26, 27, 29, 30],
-    "female": [44, 175, 43, 39, 2, 3, 9, 13, 14, 15, 16, 17, 18]
-}
 
 def direct_s2st(vocals_wav: Path, segments: List[Segment], workdir: Path,
                  force: bool = False, device: str = "cpu") -> List[Segment]:
@@ -528,7 +527,7 @@ def align_segments(segments: List[Segment], workdir: Path, force: bool = False,
 
 
 # --------------------------------------------------------------------------
-# Stage 7: reassemble full track, loudness-match, mix with background
+# Stage 7a: reassemble full track
 # --------------------------------------------------------------------------
 def load_in_stereo(wav, sample_rate):
     audio, sr = sf.read(wav, dtype="float64")
@@ -559,14 +558,124 @@ def build_hindi_vocal_track(segments: List[Segment], total_duration: float,
     sf.write(str(out_path), canvas, sample_rate)
     return out_path
 
+# --------------------------------------------------------------------------
+# Stage 7b: Vocal output cleaning and volume matching
+# --------------------------------------------------------------------------
 
-def loudness_match_and_mix(hindi_vocals: Path, background: Path, workdir: Path) -> Path:
-    normalized = workdir / "hindi_vocals_normalized.wav"
-    run([
-        "ffmpeg", "-y", "-i", str(hindi_vocals),
-        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-        str(normalized),
-    ])
+def compute_rms_envelope(x, sr, window_ms=50.0, hop_ms=10.0):
+    """Windowed RMS envelope of x (mono or multi-channel), computed WITHOUT
+    downmixing to mono. For multi-channel input this uses the mean power
+    across channels per sample (sqrt(mean(x**2)) over window*channels),
+    which avoids the phase-cancellation issues a straight mono average can
+    cause, while still giving one loudness value per window.
+
+    Returns (times_seconds, rms_values) where times are window centers.
+    """
+    win = max(1, int(round(sr * window_ms / 1000)))
+    hop = max(1, int(round(sr * hop_ms / 1000)))
+
+    power = np.mean(x.astype(np.float64) ** 2, axis=1) if x.ndim > 1 else x.astype(np.float64) ** 2
+    n = len(power)
+
+    if n < win:
+        rms = np.sqrt(np.mean(power) + 1e-12)
+        return np.array([n / (2 * sr)]), np.array([rms])
+
+    starts = np.arange(0, n - win + 1, hop)
+    csum = np.cumsum(np.concatenate(([0.0], power)))
+    sums = csum[starts + win] - csum[starts]
+    rms = np.sqrt(sums / win)
+    times = (starts + win / 2) / sr
+    return times, rms
+
+
+def match_envelope(src, ref, sr_src, sr_ref, window_ms=50.0, hop_ms=10.0,
+                    max_gain=8.0, noise_floor_db=-60.0):
+    """Return src scaled so its windowed RMS envelope follows ref's envelope.
+
+    Both src and ref keep their original channel layout throughout -- no
+    mono downmix is performed anywhere, including in the envelope analysis.
+    A single gain curve (derived from combined channel power) is applied
+    uniformly across all channels, so stereo/multichannel imaging is
+    preserved.
+    """
+    src = np.asarray(src, dtype=np.float64)
+    ref = np.asarray(ref, dtype=np.float64)
+
+    t_src, env_src = compute_rms_envelope(src, sr_src, window_ms, hop_ms)
+    t_ref, env_ref = compute_rms_envelope(ref, sr_ref, window_ms, hop_ms)
+
+    # Map the reference envelope onto the source's timeline proportionally,
+    # so differing durations / sample rates both work.
+    src_dur = src.shape[0] / sr_src
+    ref_dur = ref.shape[0] / sr_ref
+    src_pos_norm = t_src / src_dur if src_dur > 0 else t_src
+    ref_pos_norm = t_ref / ref_dur if ref_dur > 0 else t_ref
+
+    env_ref_on_src = np.interp(
+        src_pos_norm, ref_pos_norm, env_ref, left=env_ref[0], right=env_ref[-1]
+    )
+
+    noise_floor = 10 ** (noise_floor_db / 20)
+    safe_src = np.maximum(env_src, noise_floor)
+
+    gain_frames = env_ref_on_src / safe_src
+    gain_frames = np.clip(gain_frames, 1.0 / max_gain, max_gain)
+
+    # Don't boost source silence up to full volume just because the
+    # reference is loud there -- cap gain to 1x (i.e. leave it quiet).
+    silent = env_src < noise_floor
+    gain_frames[silent] = np.minimum(gain_frames[silent], 1.0)
+
+    # Interpolate the gain curve to per-sample resolution: this is what
+    # makes the result click-free instead of stepping between windows.
+    n_samples = src.shape[0]
+    sample_times = np.arange(n_samples) / sr_src
+    gain_curve = np.interp(
+        sample_times, t_src, gain_frames, left=gain_frames[0], right=gain_frames[-1]
+    )
+
+    if src.ndim > 1:
+        gain_curve = gain_curve[:, None]
+
+    out = src * gain_curve
+
+    # Peak-safe scaling instead of hard clipping: preserves the relative
+    # envelope shape rather than distorting individual samples.
+    peak = np.max(np.abs(out)) if out.size else 0.0
+    if peak > 0.999:
+        out = out * (0.999 / peak)
+    return out
+
+def normalize_new_vocals(hindi_vocals_wav: Path, vocals_wav: Path, workdir: Path, 
+                        demucs = "demucs", demucs_model="htdemucs", device="cpu", sample_rate: int = 48000) -> Path:
+    # Denoise
+    out_dir = workdir / "hindi_demucs_out"
+    ensure_dir(out_dir)
+    run([demucs, "-n", demucs_model, "--two-stems=vocals", "-o", str(out_dir), str(hindi_vocals_wav)])
+
+    # Adjust volume to match original vocals by windowing and scaling
+    new_vocals_wav = out_dir / "htdemucs" / "hindi_vocals_full" / "vocals.wav"
+    src = load_in_stereo(str(new_vocals_wav), sample_rate)
+    ref = load_in_stereo(vocals_wav, sample_rate)
+    out = match_envelope(src, ref, sample_rate, sample_rate)
+
+    normalized_wav = workdir / "hindi_vocals_normalized.wav"
+    sf.write(str(normalized_wav), out, sample_rate)
+
+    return normalized_wav
+
+# --------------------------------------------------------------------------
+# Stage 7c: reassemble full track, loudness-match, mix with background
+# --------------------------------------------------------------------------
+def loudness_match_and_mix(hindi_vocals: Path, vocals_wav:Path, background: Path, workdir: Path,
+                           device = 'cpu') -> Path:
+    normalized = normalize_new_vocals(hindi_vocals, vocals_wav, workdir, device = device)
+    # run([
+    #     "ffmpeg", "-y", "-i", str(hindi_vocals),
+    #     "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+    #     str(normalized),
+    # ])
     mixed = workdir / "final_hindi_track.wav"
     run([
         "ffmpeg", "-y",
@@ -627,11 +736,15 @@ def main():
     ap.add_argument("--max-segment-len", type=float, default=12.0,
                      help="max seconds per VAD-detected chunk fed to S2ST")
     ap.add_argument("--vc", default="chatterbox", choices=["openvoice", "chatterbox"])
+    ap.add_argument("--speakers-dir", default=Path("./speakers"), help="Directory for dubbing voices")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
     workdir = ensure_dir(args.workdir)
     log.info("Working directory: %s", workdir.resolve())
+
+    # 0 speaker mapping
+    spk_map = get_speaker_mapping(Path(args.speakers_dir))
 
     # 1. extract
     audio_wav = extract_audio(args.input, workdir / "source_audio.wav", force=args.force)
@@ -658,9 +771,8 @@ def main():
     # 4. direct speech-to-speech translation
     segments = direct_s2st(vocals_wav, segments, workdir, force=args.force, device=args.device)
 
-    log.info(segments)
     # 5. voice style transfer onto the original speaker's timbre
-    segments = build_speaker_reference(vocals_wav, segments, workdir)
+    segments = build_speaker_reference(segments, spk_map)
     if args.vc == "chatterbox":
         segments = voice_style_transfer_chatterbox(segments, workdir, force=args.force, device=args.device)
     else:
@@ -673,7 +785,7 @@ def main():
     # 7. reassemble + mix
     total_duration = get_media_duration(args.input)
     hindi_vocals_full = build_hindi_vocal_track(segments, total_duration, workdir)
-    final_hindi_track = loudness_match_and_mix(hindi_vocals_full, background_wav, workdir)
+    final_hindi_track = loudness_match_and_mix(hindi_vocals_full, vocals_wav, background_wav, workdir, args.device)
 
     # 8. mux into video
     mux_into_video(args.input, final_hindi_track, args.output)

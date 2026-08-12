@@ -1,21 +1,5 @@
-# What works
-- VAD, whisper mlx, diarization
-- Speech to speech translation - Seamless M4T + ChatterboxVC
-- Text translation (nllb, gemma, sarvam, indictrans2)
-- Emotion, gender detection
-- F5-voice cloning using ai4bharat models
-- Voice cloning Coqui XTTS v2 (preferred)
-- Removing voice artefacts, normalizing
-- integrate audio track into the video
-
-
-In Progress
-- Voice LORA support
-- Speaker classification
-- Alignment improvement
-- Prosody transfer (open problem)
-- Support scripts for model/library setup
-- Support scripts for configuring speaker references
+# Experimental Modular Voice Dubbing for Shows & Movies
+An End-to-end voice dubbing tool. For a chosen video, the tool translat
 
 
 **PLEASE NOTE** : I will not be uploading any speech clips, for privacy and as a good practice.
@@ -26,8 +10,28 @@ to use voices of the speakers already in the voice models used.
 The requirements are intentionally incomplete. What's provided works, while the other options need
 understanding what you are doing. You can also add finetuned models yourselves, for your hardware.
 
+## Current Features
+- VAD, whisper mlx, diarization
+- Speech to speech translation - Seamless M4T + ChatterboxVC
+- Text translation (nllb, gemma, sarvam, indictrans2)
+- Emotion, gender detection
+- F5-voice cloning using ai4bharat models
+- Voice cloning Coqui XTTS v2 (preferred)
+- Removing voice artefacts, normalizing
+- integrate audio track into the video
+- Autoconfiguring speaker references
+- English to Hindi dubbing
 
-# English → Hindi Video Dubbing Pipeline
+## In Progress
+- Voice LORA support
+- Speaker classification
+- Alignment improvement
+- Prosody transfer (open problem)
+- Scripts for model/library setup
+- Multilingual dubbing
+
+
+# Video Dubbing Pipeline
 
 Adds an AI-generated Hindi audio track to a video, alongside the original
 English track, while keeping the background music/effects intact and
@@ -106,14 +110,22 @@ audio.wav ──────────────► Demucs ──► vocals.
 
 ```bash
 # system dependency
-sudo apt-get install ffmpeg
+
+# Download tool
+git clone https://github.com/writer-in-fancy-pants/audio_dubbing
+cd audio_dubbing
+
+# ffmpeg on linus
+# sudo apt-get install ffmpeg   # Linux
+#brew install ffmpeg            # Mac
 
 # python dependencies
-pip install -r requirements.txt
+uv venv --python 3.13
+source .venv/bin/activate
 
-# if using --device cuda, install the CUDA build of torch that matches
-# your driver, e.g.:
+# if using --device cuda, install build of torch matching your cuda version
 # pip install torch --index-url https://download.pytorch.org/whl/cu121
+uv pip install -r requirements.txt
 ```
 
 Model weights (Demucs, whisper, NLLB-200, XTTS-v2, pyannote, etc) download automatically 
