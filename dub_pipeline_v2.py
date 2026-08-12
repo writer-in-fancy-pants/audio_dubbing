@@ -452,8 +452,8 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
 
     import whispermlx
     asr_options = {
-        "temperatures" : [0.6],
-        "logprob-threshold" : -1.25,
+        "temperatures" : [0.4],
+        "logprob-threshold" : -0.25,
         #"condition_on_previous_text": False
     }
     model = whispermlx.load_model(model_size, device=device, asr_options=asr_options)
@@ -904,20 +904,23 @@ def translate_sarvam(segments: List[Segment], workdir: Path, force: bool = False
             add_generation_prompt=True
         )
         model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
-        generated_ids = model.generate(
-            **model_inputs,
-            max_new_tokens=1024,
-            do_sample=True,
-            temperature=0.001,
-            num_return_sequences=1
-        )
-        output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
-        output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
-        output_text = re.sub(r'<[^>]*>', '', output_text) # remove model output tags
-        log.info(f"{t}, {output_text}")
-        temp = output_text.strip().strip(sym).split(sym)
-        log.info(f"{i}, {len(temp)}")
-        out.extend(temp[:thresh])
+        temp = []
+        while (i != len(temp)):
+            generated_ids = model.generate(
+                **model_inputs,
+                max_new_tokens=1024,
+                do_sample=True,
+                temperature=0.01,
+                top_p = 0.5,
+                top_k = 20,
+                num_return_sequences=1
+            )
+            output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
+            output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
+            output_text = re.sub(r'<[^>]*>', '', output_text) # remove model output tags
+            log.info(f"{t}, {output_text}")
+            temp = output_text.strip().strip(sym).split(sym)
+        out.extend(temp[:min(i+1,thresh)])
    
     for i, t in enumerate(out[:len(segments)]):
         segments[i].text_hi = t
@@ -1424,11 +1427,11 @@ def scale_vocal_background(vocals_wav, background_wav, stereo_wav, hindi_vocals,
     sf.write(output_path, final, sr)
     return output_path
 
-def loudness_match_and_mix(hindi_vocals: Path, background: Path, workdir: Path, volume) -> Path:
-    normalized = workdir / "hindi_vocals_normalized.wav"
-    run(["ffmpeg", "-y", "-i", str(hindi_vocals), "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11", str(normalized)])
+def loudness_match_and_mix(hindi_vocals: Path, background: Path, workdir: Path) -> Path:
+    # normalized = workdir / "hindi_vocals_final.wav"
+    # run(["ffmpeg", "-y", "-i", str(hindi_vocals), "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11", str(normalized)])
     mixed = workdir / "hindi_final_track.wav"
-    run(["ffmpeg", "-y", "-i", str(normalized), "-i", str(background),
+    run(["ffmpeg", "-y", "-i", str(hindi_vocals), "-i", str(background),
          "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0", str(mixed)])
     return mixed
 
