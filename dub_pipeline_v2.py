@@ -239,14 +239,14 @@ def extract_audio(video_path: Path, workdir: Path, force: bool = False):
 # --------------------------------------------------------------------------
 
 def separate_vocals(stereo_wav: Path, workdir: Path, force: bool = False,
-                     device: str = "cpu", model: str = "htdemucs"):
+                     device: str = "cpu", model: str = "htdemucs", demucs: str = "demucs"):
     out_dir = workdir / "demucs_out"
     vocals = out_dir / model / stereo_wav.stem / "vocals.wav"
     background = out_dir / model / stereo_wav.stem / "no_vocals.wav"
     vocals_16k = workdir / "vocals_16k_mono.wav"
     if not(vocals.exists() and background.exists() and vocals_16k.exists() and not force):
         ensure_dir(out_dir)
-        run([sys.executable, "-m", "demucs", "-n", model, "--two-stems", "vocals",
+        run([sys.executable, "-m", demucs, "-n", model, "--two-stems", "vocals",
              "-d", device, "-o", str(out_dir), str(stereo_wav)])
         if not vocals.exists():
             raise FileNotFoundError(f"Demucs did not produce expected output: {vocals}")
@@ -478,8 +478,7 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
 
     from transformers import pipeline
     gender_model = "alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech"
-    gender_classifier = pipeline("audio-classification", model=gender_model)
-    
+    gender_classifier = pipeline("audio-classification", model=gender_model) 
 
     segments: List[Segment] = []
     ref_dir = ensure_dir(workdir / "speaker_refs")
@@ -561,15 +560,6 @@ def _load_age_gender_model(device: str):
     processor = Wav2Vec2Processor.from_pretrained(name)
     model = AgeGenderModel.from_pretrained(name).to(device).eval()
     return processor, model
-
-def classify_gender(segments):
-    # 1. Load the audio file and automatically resample to 16kHz
-    speech, sample_rate = librosa.load(audio_path, sr=16000)
-    
-    # 2. Initialize the audio classification pipeline
-    # We use a specialized fine-tuned wav2vec2 model for gender classification
-    
-    return predictions
 
 def classify_age_gender(segments: List[Segment], vocals_16k: Path, workdir: Path,
                           force: bool = False, device: str = "cpu") -> List[Segment]:
@@ -809,8 +799,75 @@ def translate_nllb(segments: List[Segment], workdir: Path, force: bool = False,
     cache.write_text(json.dumps([{"index": s.index, "text_hi": s.text_hi} for s in segments], indent=2))
     return segments
 
+
+def build_texts_for_translate(segments, sym, thresh=30):
+    # Generate the output
+    texts = []
+    i = 0
+    text = ''
+    gender = segments[0].gender
+
+    def append_text(seg, t, g, i):
+        if len(t) > 0:
+            texts.append((t, g, i))
+        return f'{seg.text_en} {sym} ', seg.gender, 1
+
+    for seg in segments:
+        if gender != seg.gender:
+            text, gender, i = append_text(seg, text, gender, i)
+        else:
+            text += f'{seg.text_en} {sym} '
+            i+=1
+        if i%thresh == 0:
+            text, gender,i = append_text(seg, text, gender, i)
+
+    if i!= 0:
+        texts.append((text, gender, i))
+
+    return texts
+
+def translate_mlx(segments: List[Segment], workdir: Path, force: bool = False,
+                     device: str = "cpu", tgt_lang = "Hindi", sym='+',
+                     model_name = "lmstudio-community/gemma-4-E4B-it-MLX-4bit") -> List[Segment]:
+    cache = workdir / "translated.json"
+    if cache.exists() and not force:
+        cached = {s["index"]: (s["text_hi"], s["start"], s["end"]) for s in json.loads(cache.read_text())}
+        if all(seg.index in cached for seg in segments):
+            for seg in segments:
+                seg.text_hi = cached[seg.index][0]
+                seg.start = cached[seg.index][1]
+                seg.end = cached[seg.index][2]
+            return segments
+
+    import re
+    from mlx_lm import generate, load
+
+    # Load the model and tokenizer
+    model, tokenizer = load(model_name)
+    thresh = 30
+    texts = build_texts_for_translate(segments, sym, thresh)
+    out = []
+
+    for t,g,i in texts:
+        prompt = f"""<bos><start_of_turn>user
+Translate the English text below to {tgt_lang}. Speaker gender {g}. Do not translate, change, or remove {sym}, keep {sym} in the exact same spot in the text. 
+
+{t}<end_of_turn>"""
+        output_text = generate(model, tokenizer, prompt=prompt, max_tokens = min(4*len(t),200))
+        output_text = re.sub(r'<[^>]*>', '', output_text) # remove model output tags
+        temp = output_text.strip().strip(sym).split(sym)
+        out.extend(temp[:thresh])
+
+    for i, t in enumerate(out[:len(segments)]):
+        segments[i].text_hi = t
+
+    cache.write_text(json.dumps([{"index": s.index, "text_hi": s.text_hi, 
+                              "start":s.start, "end":s.end} for s in segments], indent=2))
+    return segments
+
 def translate_sarvam(segments: List[Segment], workdir: Path, force: bool = False,
-                     device: str = "cpu", tgt_lang = "Hindi", model_name = "sarvamai/sarvam-translate") -> List[Segment]:
+                     device: str = "cpu", tgt_lang = "Hindi", sym='+',
+                     model_name = "sarvamai/sarvam-translate") -> List[Segment]:
     """Fallback translator if IndicTransToolkit isn't installed."""
     cache = workdir / "translated.json"
     if cache.exists() and not force:
@@ -829,26 +886,17 @@ def translate_sarvam(segments: List[Segment], workdir: Path, force: bool = False
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
 
-    # Generate the output
-    texts = []
-    out = []
     thresh = 30
-    i = 0
-    text = ''
-    for seg in segments:
-        text += f'({seg.gender}) {seg.text_en}'
-        i+=1
-        if i%thresh == 0:
-            texts.append(text[:-1])
-            text = f'({seg.gender}) {seg.text_en}'
-            i = 0
-            continue
-    if i!= 0:
-        texts.append(text[:-1])
-    for text in texts:
+    texts = build_texts_for_translate(segments, sym, thresh)
+    out = []
+
+    #if i!= 0:
+    #    texts.append((text, gender, i))
+
+    for t,g,i in texts:
         messages = [
-            {"role": "system", "content": f"Translate the text below to {tgt_lang}. Each phrase is preceded by speaker's gender descriptor (Male/Female). Use surrounding text as context."},
-            {"role": "user", "content": text}
+            {"role": "system", "content": f"Translate the text to {tgt_lang}. {g} speaker. Do not translate, change, or remove {sym}, keep {sym} in the exact same spot in the text"},
+            {"role": "user", "content": t}
         ]
         text = tokenizer.apply_chat_template(
             messages,
@@ -860,20 +908,17 @@ def translate_sarvam(segments: List[Segment], workdir: Path, force: bool = False
             **model_inputs,
             max_new_tokens=1024,
             do_sample=True,
-            temperature=0.01,
+            temperature=0.001,
             num_return_sequences=1
         )
         output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
         output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
-        log.info(f"Pairs : {text}, {output_text}")
         output_text = re.sub(r'<[^>]*>', '', output_text) # remove model output tags
-        output_text = re.sub(r'([^)]*)', '|', output_text) # remove model output tags
-        log.info(f"Pairs : {text}, {output_text}")
-        temp = output_text.split('|')
-        out.extend(temp[:thresh-1])
-    if len(temp) > thresh :
-        out.append(temp[thresh]) # last element
-    log.info(f"Length {len(segments)}, {len(out)}")
+        log.info(f"{t}, {output_text}")
+        temp = output_text.strip().strip(sym).split(sym)
+        log.info(f"{i}, {len(temp)}")
+        out.extend(temp[:thresh])
+   
     for i, t in enumerate(out[:len(segments)]):
         segments[i].text_hi = t
 
@@ -1101,7 +1146,7 @@ def synth_coqui(segments: List[Segment], profiles: Dict[str, List[str]],
         if not seg.ref_audio_path:
             log.warning("No reference audio for segment %s, skipping", seg.index)
             continue
-        if len(seg.text_en) < 11:# or len(profiles[seg.speaker]) == 0:
+        if len(seg.text_en) < 12:# or len(profiles[seg.speaker]) == 0:
             shutil.copy(seg.ref_audio_path, out_path)
         else:
             if profiles[seg.speaker] and len(profiles[seg.speaker]) > 0:
@@ -1132,17 +1177,16 @@ def get_duration(wav_path: Path) -> float:
     info = sf.info(str(wav_path))
     return info.frames / info.samplerate
 
-
 def time_stretch(in_path: Path, out_path: Path, factor: float):
-    factor = max(0.5, min(factor, 2.0))
+    factor = max(0.5, factor)
     run(["ffmpeg", "-y", "-i", str(in_path), "-filter:a", f"atempo={factor:.4f}", str(out_path)])
 
 
 def align_segments(segments: List[Segment], workdir: Path, force: bool = False,
-                    max_stretch: float = 1.6) -> List[Segment]:
+                    max_stretch: float = 1.5) -> List[Segment]:
     aligned_dir = ensure_dir(workdir / "aligned")
     for seg in segments:
-        if not seg.tts_audio_path:
+        if not seg.tts_audio_path or len(seg.text_hi) < 1:
             continue
         out_path = aligned_dir / f"seg_{seg.index:04d}.wav"
         if out_path.exists() and not force:
@@ -1165,57 +1209,225 @@ def align_segments(segments: List[Segment], workdir: Path, force: bool = False,
 # Stage 9: reassemble (with short crossfades), loudness-match, mix
 # --------------------------------------------------------------------------
 
-def build_hindi_vocal_track(segments: List[Segment], total_duration: float, workdir: Path,
-                              sample_rate: int = 48000, fade_ms: float = 15.0) -> Path:
+def load_in_stereo(wav, sample_rate):
+    audio, sr = sf.read(wav, dtype="float64")
+    if audio.ndim == 1:
+        audio = np.stack([audio, audio], axis=1)
+    if sr != sample_rate:
+        # resample if needed (XTTS/IndicF5/Parler emit at their own
+        # native rates -- 24kHz for IndicF5, model-specific for Parler)
+        audio = librosa.resample(audio.T, orig_sr=sr, target_sr=sample_rate).T
+    return audio
+
+def normalize_peak(in_array, ceiling=0.999):
+    """Apply the maximum possible gain to the whole track without clipping.
+    Returns (normalized_out, applied_gain_linear).
+    """
+    out = np.asarray(in_array, dtype=np.float64)
+    peak = np.max(np.abs(out)) if out.size else 0.0
+
+    if peak == 0:
+        return out, 1.0  # silent track, nothing to normalize
+
+    applied_gain = ceiling / peak
+    return out * applied_gain, applied_gain
+
+def build_hindi_vocal_track(segments: List[Segment], vocals:Path, total_duration: float, workdir: Path,
+                              sample_rate: int = 48000, fade_ms: float = 10.0) -> Path:
     out_path = workdir / "hindi_vocals_full.wav"
-    canvas = np.zeros((int(total_duration * sample_rate) + sample_rate, 2), dtype=np.float32)
+    canvas = np.zeros((int(total_duration * sample_rate) + sample_rate, 2), dtype=np.float64)
     fade_samples = int(sample_rate * fade_ms / 1000.0)
 
+    # Do not overlap speech
+    prev_end = -1
+    fade = int(fade_ms*sample_rate/1000)
     for seg in sorted(segments, key=lambda s: s.start):
         if not seg.aligned_audio_path:
             continue
-        audio, sr = sf.read(seg.aligned_audio_path, dtype="float32")
-        if audio.ndim == 1:
-            audio = np.stack([audio, audio], axis=1)
-        if sr != sample_rate:
-            # resample if needed (XTTS/IndicF5/Parler emit at their own
-            # native rates -- 24kHz for IndicF5, model-specific for Parler)
-            import librosa
-            audio = librosa.resample(audio.T, orig_sr=sr, target_sr=sample_rate).T
+        audio = load_in_stereo(seg.aligned_audio_path, sample_rate)
+
+        # Start, end
+        start_sample = int(seg.start * sample_rate)
+        if start_sample < prev_end:
+            start_sample = prev_end+fade
+        end_sample = int(start_sample + len(audio))
+        #prev_end = end_sample
 
         if len(audio) > 2 * fade_samples:
             ramp = np.linspace(0, 1, fade_samples)[:, None]
             audio[:fade_samples] *= ramp
             audio[-fade_samples:] *= ramp[::-1]
 
-        start_sample = int(seg.start * sample_rate)
-        end_sample = start_sample + len(audio)
         if end_sample > canvas.shape[0]:
             canvas = np.pad(canvas, ((0, end_sample - canvas.shape[0]), (0, 0)))
         canvas[start_sample:end_sample] += audio[:, :2] if audio.shape[1] >= 2 else audio
+    canvas, _ = normalize_peak(canvas, ceiling=0.999)
 
-    sf.write(str(out_path), canvas, sample_rate)
+    sf.write(str(out_path), canvas, sample_rate,subtype='PCM_16')
     return out_path
 
-def int16_to_dbfs(sample_value):
-    # Handle absolute silence to avoid math domain error
-    if sample_value == 0:
-        return float('-inf')
-    # 32768 is the maximum absolute value for a signed 16-bit integer
-    max_val = 32768.0
-    # Calculate decibels relative to full scale (dBFS)
-    dbfs = 20 * math.log10(abs(sample_value) / max_val)
-    return dbfs
+###############
+# Vocal output cleaning and volume matching
+###############
+
+def compute_rms_envelope(x, sr, window_ms=50.0, hop_ms=10.0):
+    """Windowed RMS envelope of x (mono or multi-channel), computed WITHOUT
+    downmixing to mono. For multi-channel input this uses the mean power
+    across channels per sample (sqrt(mean(x**2)) over window*channels),
+    which avoids the phase-cancellation issues a straight mono average can
+    cause, while still giving one loudness value per window.
+
+    Returns (times_seconds, rms_values) where times are window centers.
+    """
+    win = max(1, int(round(sr * window_ms / 1000)))
+    hop = max(1, int(round(sr * hop_ms / 1000)))
+
+    power = np.mean(x.astype(np.float64) ** 2, axis=1) if x.ndim > 1 else x.astype(np.float64) ** 2
+    n = len(power)
+
+    if n < win:
+        rms = np.sqrt(np.mean(power) + 1e-12)
+        return np.array([n / (2 * sr)]), np.array([rms])
+
+    starts = np.arange(0, n - win + 1, hop)
+    csum = np.cumsum(np.concatenate(([0.0], power)))
+    sums = csum[starts + win] - csum[starts]
+    rms = np.sqrt(sums / win)
+    times = (starts + win / 2) / sr
+    return times, rms
+
+
+def match_envelope(src, ref, sr_src, sr_ref, window_ms=50.0, hop_ms=10.0,
+                    max_gain=8.0, noise_floor_db=-60.0):
+    """Return src scaled so its windowed RMS envelope follows ref's envelope.
+
+    Both src and ref keep their original channel layout throughout -- no
+    mono downmix is performed anywhere, including in the envelope analysis.
+    A single gain curve (derived from combined channel power) is applied
+    uniformly across all channels, so stereo/multichannel imaging is
+    preserved.
+    """
+    src = np.asarray(src, dtype=np.float64)
+    ref = np.asarray(ref, dtype=np.float64)
+
+    t_src, env_src = compute_rms_envelope(src, sr_src, window_ms, hop_ms)
+    t_ref, env_ref = compute_rms_envelope(ref, sr_ref, window_ms, hop_ms)
+
+    # Map the reference envelope onto the source's timeline proportionally,
+    # so differing durations / sample rates both work.
+    src_dur = src.shape[0] / sr_src
+    ref_dur = ref.shape[0] / sr_ref
+    src_pos_norm = t_src / src_dur if src_dur > 0 else t_src
+    ref_pos_norm = t_ref / ref_dur if ref_dur > 0 else t_ref
+
+    env_ref_on_src = np.interp(
+        src_pos_norm, ref_pos_norm, env_ref, left=env_ref[0], right=env_ref[-1]
+    )
+
+    noise_floor = 10 ** (noise_floor_db / 20)
+    safe_src = np.maximum(env_src, noise_floor)
+
+    gain_frames = env_ref_on_src / safe_src
+    gain_frames = np.clip(gain_frames, 1.0 / max_gain, max_gain)
+
+    # Don't boost source silence up to full volume just because the
+    # reference is loud there -- cap gain to 1x (i.e. leave it quiet).
+    silent = env_src < noise_floor
+    gain_frames[silent] = np.minimum(gain_frames[silent], 1.0)
+
+    # Interpolate the gain curve to per-sample resolution: this is what
+    # makes the result click-free instead of stepping between windows.
+    n_samples = src.shape[0]
+    sample_times = np.arange(n_samples) / sr_src
+    gain_curve = np.interp(
+        sample_times, t_src, gain_frames, left=gain_frames[0], right=gain_frames[-1]
+    )
+
+    if src.ndim > 1:
+        gain_curve = gain_curve[:, None]
+
+    out = src * gain_curve
+
+    # Peak-safe scaling instead of hard clipping: preserves the relative
+    # envelope shape rather than distorting individual samples.
+    peak = np.max(np.abs(out)) if out.size else 0.0
+    if peak > 0.999:
+        out = out * (0.999 / peak)
+    return out
+
+def normalize_new_vocals(hindi_vocals_wav: Path, vocals_wav: Path, workdir: Path, 
+                        demucs = "demucs", demucs_model="htdemucs", device="cpu", sample_rate: int = 48000) -> Path:
+    # Denoise
+    out_dir = workdir / "hindi_demucs_out"
+    ensure_dir(out_dir)
+    run([demucs, "-n", demucs_model, "--two-stems=vocals", "-o", str(out_dir), str(hindi_vocals_wav)])
+
+    # Adjust volume to match original vocals by windowing and scaling
+    new_vocals_wav = out_dir / "htdemucs" / "hindi_vocals_full" / "vocals.wav"
+    src = load_in_stereo(str(new_vocals_wav), sample_rate)
+    ref = load_in_stereo(vocals_wav, sample_rate)
+    out = match_envelope(src, ref, sample_rate, sample_rate)
+
+    normalized_wav = workdir / "hindi_vocals_normalized.wav"
+    sf.write(str(normalized_wav), out, sample_rate)
+
+    return normalized_wav
+
+def solve_coefficients(arr1, arr2, arr3):
+    """
+    Finds scalars x and y that minimize ||x*arr1 + y*arr2 - arr3||_2
+    Works for arrays of any shape, including multi-channel layouts.
+    """
+    # 1. Stack as columns to form the design matrix A of shape (N,4)
+    x = []
+    y =[]
+
+    log.info(f"arr1={np.linalg.norm(arr1):0.2f}, arr2={np.linalg.norm(arr2):.2f}, arr3={np.linalg.norm(arr3):.2f}")
+    for i in range(arr3.shape[1]):
+        A = np.column_stack([arr1[:, i], arr2[:, i]])
+        (x1, x2), _, _, _ = np.linalg.lstsq(A, arr3[:, i], rcond=None)
+        residual = np.sqrt(np.mean((x1 * arr1[:,i] + x2 * arr2[:,i] - arr3[:,i]) ** 2))
+        log.info(f"x1={x1:.4f}, x2={x2:.4f}, fit RMS error={residual:.6f}")
+        x.append(x1)
+        y.append(x2)
+    # 4. Return optimized x and y
+    return np.array(x), np.array(y)
+
+def adjust_array(arr, max_len):
+    if max_len > arr.shape[0]:
+        return np.pad(arr, ((0, max_len - arr.shape[0]), (0,0)), mode='constant')
+    elif max_len < arr.shape[0]:
+        return arr[:max_len, :]
+    return arr
+
+def scale_vocal_background(vocals_wav, background_wav, stereo_wav, hindi_vocals, workdir, duration, sr=48000):
+    # May need to stack audios
+    arr1 = load_in_stereo(vocals_wav, sr)
+    arr2  = load_in_stereo(background_wav, sr)
+    arr3 = load_in_stereo(stereo_wav, sr)
+
+    l = min(arr1.shape[0], arr2.shape[0], arr3.shape[0])
+    x, y = solve_coefficients(arr1[:l,:], arr2[:l,:], arr3[:l,:])
+
+    log.info(f"{x},{y}")
+
+    new_arr1 = load_in_stereo(hindi_vocals, sr)
+    max_len = int(duration*sr)
+
+    log.info(f"{new_arr1.shape}, {arr2.shape}, {duration}")
+    new_arr1 = x[np.newaxis,:]*adjust_array(new_arr1, max_len)
+    arr2 = y[np.newaxis,:]*adjust_array(arr2, max_len)
+
+    final, gain = normalize_peak(new_arr1+arr2)
+    log.info(f"{final.shape}, {gain}")
+    output_path = workdir / "hindi_final_track.wav"
+    sf.write(output_path, final, sr)
+    return output_path
 
 def loudness_match_and_mix(hindi_vocals: Path, background: Path, workdir: Path, volume) -> Path:
     normalized = workdir / "hindi_vocals_normalized.wav"
-    run(["ffmpeg", "-y", "-i", str(hindi_vocals), "-af", f"loudnorm=I=-16:TP={int16_to_dbfs(volume)}:LRA=11", str(normalized)])
-    #from pydub import AudioSegment
-    #audio = AudioSegment.from_file(normalized)
-    #change_in_dBFS = volume - audio.dBFS
-    #normalized_audio = audio.apply_gain(change_in_dbFS)
-    #normalized_audio.export(normalized, format="wav")
-    mixed = workdir / "final_hindi_track.wav"
+    run(["ffmpeg", "-y", "-i", str(hindi_vocals), "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11", str(normalized)])
+    mixed = workdir / "hindi_final_track.wav"
     run(["ffmpeg", "-y", "-i", str(normalized), "-i", str(background),
          "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0", str(mixed)])
     return mixed
@@ -1244,10 +1456,19 @@ def get_media_duration(path: Path) -> float:
     )
     return float(result.stdout.strip())
 
-
 # --------------------------------------------------------------------------
 # Orchestration
 # --------------------------------------------------------------------------
+
+def slowdown(input, speed, workdir, force=False):
+    outpath = workdir / f"temp.{input.suffix}"
+    # No need to slowdown
+    if abs(speed - round(speed)) <= 0.001:
+        return input
+    if not outpath.exists() or force:
+        run(['ffmpeg', '-i', input, '-filter_complex', f"[0:v]setpts=1/{speed}*PTS[v];[0:a]atempo={speed}[a]",
+            '-map', "[v]", '-map', "[a]", outpath])
+    return outpath
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1272,13 +1493,14 @@ def main():
                      help="skip emotion classification; defaults every segment to 'neutral'")
     ap.add_argument("--emotion-backend", default="categorical", choices=["categorical", "dimensional"])
 
-    ap.add_argument("--translator", default="indictrans2", choices=["indictrans2", "nllb", "gemma", "sarvam"])
+    ap.add_argument("--translator", default="indictrans2", choices=["indictrans2", "nllb", "mlx", "sarvam"])
 
     ap.add_argument("--tts-method", required=True, choices=["parler", "clone", 'coqui'])
     ap.add_argument("--speaker-overrides", type=Path, default=None,
                      help="JSON: {\"SPEAKER_00\": {\"parler_preset\": \"Rohit\"}} to manually pin presets")
     ap.add_argument("--f5-ref-max-seconds", type=float, default=6.0)
-    ap.add_argument("--max-stretch", type=float, default=1.5)
+    ap.add_argument("--max-stretch", type=float, default=2.0)
+    ap.add_argument("--slowdown", type=float, default=1.0)
 
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
@@ -1287,6 +1509,8 @@ def main():
     device = resolve_device(args.device)
     log.info("Working directory: %s", workdir.resolve())
 
+    # Slow down video a bit, helps with language transition - hindi is slower
+    args.input = slowdown(args.input, args.slowdown, workdir)
 
     sub = None
     segments=None
@@ -1338,19 +1562,20 @@ def main():
                 segments = translate_nllb(segments, workdir, force=args.force, device=device)
         elif args.translator == "nllb":
             segments = translate_nllb(segments, workdir, force=args.force, device=device)
-        elif args.translator == "gemma":
-            segments = translate_sarvam(segments, workdir, force=args.force, device=device, model_name="google/translategemma-4b-it")
+        elif args.translator == "mlx":
+            segments = translate_mlx(segments, workdir, force=args.force, device=device, model_name="mlx-community/sarvam-translate-mlx-4bit")
         else:
             segments = translate_sarvam(segments, workdir, force=args.force, device=device)
 
         for seg in segments:
             print(seg.text_en, seg.text_hi)
 
+    segments = extract_pitch_and_speed(segments, vocals_16k) 
     if args.tts_method == "parler":
         if not args.no_detect_emotion:
             segments = classify_emotion(segments, vocals_16k, workdir, force=args.force,
                                           device=device, backend=args.emotion_backend)
-        segments = extract_pitch_and_speed(segments, vocals_16k)  # always runs; also fills gender fallback
+         # always runs; also fills gender fallback
         profiles = build_speaker_profiles(segments, workdir, override_path=args.speaker_overrides)
 
         for seg in segments:
@@ -1371,10 +1596,13 @@ def main():
     segments = align_segments(segments, workdir, force=args.force, max_stretch=args.max_stretch)
 
     total_duration = get_media_duration(args.input)
-    hindi_vocals_full = build_hindi_vocal_track(segments, total_duration, workdir)
-    final_hindi_track = loudness_match_and_mix(hindi_vocals_full, background_wav, workdir, vol)
+    hindi_vocals_full = build_hindi_vocal_track(segments, vocals_wav, total_duration, workdir)
+    hindi_vocals_normalized = normalize_new_vocals(hindi_vocals_full, vocals_wav, workdir)
+    # hindi_final_track = scale_vocal_background(vocals_wav, background_wav, stereo_wav, hindi_vocals_normalized, workdir, 
+    #                                            total_duration, sr=48000)
+    hindi_final_track = loudness_match_and_mix(hindi_vocals_normalized, background_wav, workdir)
 
-    mux_into_video(args.input, final_hindi_track, args.output)
+    mux_into_video(args.input, hindi_final_track, args.output)
     log.info("Done. Output: %s", args.output.resolve())
 
 if __name__ == "__main__":
