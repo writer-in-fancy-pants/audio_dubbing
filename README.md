@@ -1,5 +1,7 @@
 # Experimental Modular Voice Dubbing for Shows & Movies
-An End-to-end voice dubbing tool. For a chosen video, the tool translat
+An End-to-end voice dubbing tool. For a chosen video, the tool translates the audio track, using 
+  - Speech transcription -> translation -> text-to speech
+  - Speech to speech translation -> Voice style transfer / voice cloning
 
 **PLEASE NOTE** : I will not be uploading any speech clips, for privacy and as a good practice.
 Please acquire speech clips and place them in speakers/male and speakers/female directories. 
