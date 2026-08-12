@@ -289,24 +289,31 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
             # fall back to majority vote over this segment's words
             spk_counts = Counter(w.get("speaker") for w in seg["words"] if w.get("speaker"))
             speaker = spk_counts.most_common(1)[0][0] if spk_counts else "SPEAKER_00"
-
+        
         # Audio clip
         start_sample = int(seg["start"] * sr)
-        end_sample = int(min(seg["end"], seg["start"] + 8.0) * sr)
+        #end_sample = int(min(seg["end"], seg["start"] + 15.0) * sr)
+        end_sample = int(seg["end"] * sr) # needed for complete s2st
         clip = audio[start_sample:end_sample]
 
         # Get gender
         results = gender_classifier(clip)
+        gender = results[0]['label'].lower()
+
+        # Reference voice id
+        try:
+            speaker_id = SPEAKER_MAPPING[gender][int(speaker.split('_')[-1])]
+        except:
+            speaker_id = SPEAKER_MAPPING[gender][-1]
 
         # Write audio
         sf.write(str(ref_path), clip, sr)
         # Finalized segment
         segments.append(Segment(
             index=i, start=float(seg["start"]), end=float(seg["end"]),
-            speaker=speaker or "SPEAKER_00", text_en=text,
-            ref_audio_path = str(ref_path), gender=results[0]['label']
+            speaker=speaker_id, text_en=text,
+            ref_audio_path = str(ref_path), gender=gender
         ))
-
 
     cache.write_text(json.dumps([asdict(s) for s in segments], indent=2))
     log.info("Final: %d segments across %d speakers", len(segments),
@@ -319,17 +326,18 @@ def build_speaker_reference(vocals_wav: Path, segments: List[Segment], workdir: 
     voice style transfer stage has consistent timbre to target. Swap this
     for per-speaker diarization + per-speaker refs if you need multiple
     distinct cloned voices."""
-    import soundfile as sf
 
-    ref_dir = ensure_dir(workdir / "speaker_refs")
-    longest = max(segments, key=lambda s: s.end - s.start)
-    audio, sr = sf.read(str(vocals_wav))
-    start_sample = int(longest.start * sr)
-    end_sample = int(min(longest.end, longest.start + 8.0) * sr)
-    ref_path = ref_dir / "SPEAKER_default.wav"
-    sf.write(str(ref_path), audio[start_sample:end_sample], sr)
+    # ref_dir = ensure_dir(workdir / "speaker_refs")
+    # longest = max(segments, key=lambda s: s.end - s.start)
+    # audio, sr = sf.read(str(vocals_wav))
+    # start_sample = int(longest.start * sr)
+    # end_sample = int(min(longest.end, longest.start + 8.0) * sr)
+    # ref_path = ref_dir / "SPEAKER_default.wav"
+    # sf.write(str(ref_path), audio[start_sample:end_sample], sr)
+
+    # reference speaker
     for seg in segments:
-        seg.ref_audio_path = str(ref_path)
+        seg.ref_audio_path = Path("./seamless_outputs") / f"seg_0348_spk_{seg.speaker}_{seg.gender}.wav"
     return segments
 
 
@@ -370,23 +378,26 @@ def direct_s2st(vocals_wav: Path, segments: List[Segment], workdir: Path,
             seg.s2st_audio_path = str(out_path)
             continue
 
-        start_sample = int(seg.start * new_sr)
-        end_sample = int(seg.end * new_sr)
-        chunk = np_audio[start_sample:end_sample]
-        if len(chunk) < new_sr * 0.5:  # skip slivers under ~500ms
+        if seg.end - seg.start < 0.05:  # skip slivers under ~50ms
             continue
+        elif seg.end - seg.start < 0.4 or len(seg.text_en) < 10: # Keep originals for short clips
+            seg.s2st_audio_path =  seg.ref_audio_path
+        else:
+            start_sample = int(seg.start * new_sr)
+            end_sample = int(seg.end * new_sr)
+            chunk = np_audio[start_sample:end_sample]
 
-        inputs = processor(audio=chunk, sampling_rate=new_sr, return_tensors="pt").to(device)
-        with torch.no_grad():
-            output = model.generate(**inputs, tgt_lang="hin", generate_speech=True, 
-                        speaker_id = SPEAKER_MAPPING[seg.gender.lower()][int(seg.speaker.split('_')[-1])])
+            inputs = processor(audio=chunk, sampling_rate=new_sr, return_tensors="pt").to(device)
+            with torch.no_grad():
+                output = model.generate(**inputs, tgt_lang="hin", 
+                                        generate_speech=True, speaker_id = seg.speaker)
 
-        waveform = output[0][0].cpu().numpy().squeeze()
-        sf.write(str(out_path), waveform, model.config.sampling_rate)
-        seg.s2st_audio_path = str(out_path)
-        log.info("Segment %d: %.2fs -> %.2fs translated (direct S2ST, no text)",
-                  seg.index, seg.start, seg.end)
+            waveform = output[0][0].cpu().numpy().squeeze()
+            sf.write(str(out_path), waveform, model.config.sampling_rate)
+            seg.s2st_audio_path = str(out_path)
 
+            log.info("Segment %d: %.2fs -> %.2fs translated (direct S2ST, no text)",
+                    seg.index, seg.start, seg.end)
     return segments
 
 
@@ -412,7 +423,7 @@ def voice_style_transfer(segments: List[Segment], workdir: Path, force: bool = F
     converter.load_ckpt(f"{checkpoint_dir}/checkpoint.pth")
 
     # cache target-speaker embeddings per unique reference clip
-    # target_se_cache = {}
+    target_se_cache = {}
     for seg in segments:
         if not seg.s2st_audio_path:
             continue
@@ -425,10 +436,10 @@ def voice_style_transfer(segments: List[Segment], workdir: Path, force: bool = F
             seg.styled_audio_path = seg.s2st_audio_path
             continue
 
-        # if seg.ref_audio_path not in target_se_cache:
-        #     target_se, _ = se_extractor.get_se(seg.ref_audio_path, converter, vad=False)
-        #     target_se_cache[seg.ref_audio_path] = target_se
-        # target_se = target_se_cache[seg.ref_audio_path]
+        if seg.ref_audio_path not in target_se_cache:
+            target_se, _ = se_extractor.get_se(seg.ref_audio_path, converter, vad=False)
+            target_se_cache[seg.ref_audio_path] = target_se
+        target_se = target_se_cache[seg.ref_audio_path]
 
         source_se, _ = se_extractor.get_se(seg.s2st_audio_path, converter, vad=False)
 
@@ -463,13 +474,11 @@ def voice_style_transfer_chatterbox(segments: List[Segment], workdir: Path,
             seg.styled_audio_path = seg.s2st_audio_path
             continue
 
-        speaker_id = SPEAKER_MAPPING[seg.gender.lower()][int(seg.speaker.split('_')[-1])]
-
         arr = voice_model.generate(
             seg.s2st_audio_path,
-            Path("./seamless_outputs") / f"seg_0348_spk_{speaker_id}_{seg.gender}.wav"
-            #seg.ref_audio_path,
+            seg.ref_audio_path
         )
+
         log.info(f"{voice_model.sr} {arr.shape}")
         torchaudio.save(out_path, arr, voice_model.sr)
         #sf.write(out_path, data=arr.numpy(), samplerate=voice_model.sr)
@@ -638,7 +647,6 @@ def main():
             vocals_16k, workdir, force=args.force, model_size=args.whisper_model,
             device=args.device, diarize=args.diarize, hf_token=args.hf_token,
         )
-        segments = build_speaker_reference(vocals_wav, segments, workdir)
     else:
         # 3. VAD segmentation (acoustic only -- no transcription)
         segments = vad_segment(vocals_wav, workdir, force=args.force,
@@ -652,6 +660,7 @@ def main():
 
     log.info(segments)
     # 5. voice style transfer onto the original speaker's timbre
+    segments = build_speaker_reference(vocals_wav, segments, workdir)
     if args.vc == "chatterbox":
         segments = voice_style_transfer_chatterbox(segments, workdir, force=args.force, device=args.device)
     else:
