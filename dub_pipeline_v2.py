@@ -158,6 +158,45 @@ logging.basicConfig(
 )
 log = logging.getLogger("dub_pipeline_s2t2s")
 
+SPEECH_CATEGORIES = {
+    "age": {
+        "labels": ["child", "young adult", "middle-aged", "old"],
+        "template": "a recording of a {} speaker's voice",
+    },
+    "gender": {
+        "labels": ["male", "female"],
+        "template": "a recording of a {} voice",
+    },
+    "quality": {
+        "labels": ["smooth", "rough", "breathy", "raspy", "nasal", "shaky", "monotone", "warm"],
+        "template": "a voice with a {} quality",
+    },
+    "emotion": {
+        "labels": ["happy", "sad", "angry", "neutral", "excited", "calm", "fearful", "surprised"],
+        "template": "speech delivered in a {} and expressive manner",
+    },
+    "speed": {
+        "labels": ["slow", "moderate", "fast"],
+        "template": "speech spoken at a {} speed",
+    },
+    "pitch": {
+        "labels": ["low", "medium", "high"],
+        "template": "a voice with a {} pitch",
+    },
+    "clarity": {
+        "labels": ["clear", "muffled"],
+        "template": "a recording where the speaker's voice sounds {}",
+    },
+    "distance": {
+        "labels": ["close", "distant"],
+        "template": "a recording where the speaker sounds {}",
+    },
+}
+
+lang_ref ={
+    'en':['eng', 'en', 'english'],
+    'hi':['hin', 'hi', 'hindi']
+}
 
 # --------------------------------------------------------------------------
 # Data model
@@ -172,13 +211,23 @@ class Segment:
     text_en: str = ""
     text_hi: Optional[str] = None
 
-    gender: Optional[str] = None          # "male" | "female" | "child"
-    age_years: Optional[float] = None
-    emotion: Optional[str] = None          # coarse categorical label
+    # CLAP based
+    description: Optional[str] = None
+    age: Optional[str] = None
+    gender: Optional[str] = None  
+    quality: Optional[str] = None
+    emotion: Optional[str] = None    
+    speed: Optional[str] = None 
+    pitch: Optional[str] = None 
+    clarity: Optional[str] = None 
+    distance: Optional[str] = None 
+
+    # coarse categorical label
     arousal: Optional[float] = None        # 0..1, if using the dimensional model
     valence: Optional[float] = None
     dominance: Optional[float] = None
 
+    age_years: Optional[int] = None
     pitch_hz: Optional[float] = None
     speed_wps: Optional[float] = None      # words per second
 
@@ -278,10 +327,6 @@ def get_subtitles(video_path: str, lang='hi') -> bool:
     """
     import ffmpeg
     out = []
-    lang_ref ={
-        'en':['eng', 'en', 'english'],
-        'hi':['hin', 'hi', 'hindi']
-    }
     try:
         # Probe the video file to extract its metadata
         probe = ffmpeg.probe(video_path)
@@ -358,12 +403,67 @@ def read_subs_as_whisper_segments(sub_file, lang='hi'):
 
 
 # --------------------------------------------------------------------------
+# Stage 2.9: CLAP based descriptions
+# --------------------------------------------------------------------------
+def extract_tensor(output) -> torch.Tensor:
+    """get_audio_features / get_text_features should return a tensor directly,
+    but some versions/paths can return a model output object instead.
+    This normalizes both cases into a plain tensor."""
+    if isinstance(output, torch.Tensor):
+        return output
+    if hasattr(output, "pooler_output") and output.pooler_output is not None:
+        return output.pooler_output
+    if hasattr(output, "last_hidden_state"):
+        return output.last_hidden_state[:, 0, :]
+    raise TypeError(f"Unexpected output type from CLAP feature extractor: {type(output)}")
+
+@torch.no_grad()
+def get_audio_embedding(audio, model, processor, device) -> torch.Tensor:
+    inputs = processor(audios=audio, sampling_rate=48000, return_tensors="pt").to(device)
+    audio_embed = extract_tensor(model.get_audio_features(**inputs))
+    return audio_embed / audio_embed.norm(dim=-1, keepdim=True)
+
+def get_clap_description(segment, audio, model, processor, device='mps', language='hindi'):
+    audio_embed = get_audio_embedding(audio, model, processor, device)
+
+    @torch.no_grad()
+    def best_clap_label(category: str) -> str:
+        labels = SPEECH_CATEGORIES[category]["labels"]
+        template = SPEECH_CATEGORIES[category]["template"]
+        texts = [template.format(l) for l in labels]
+
+        text_inputs = processor(text=texts, return_tensors="pt", padding=True).to(device)
+        text_embed = extract_tensor(model.get_text_features(**text_inputs))
+        text_embed = text_embed / text_embed.norm(dim=-1, keepdim=True)
+
+        sims = (audio_embed @ text_embed.T).squeeze(0)
+        best_idx = sims.argmax().item()
+        return labels[best_idx]
+    
+    segment.age = best_clap_label("age")
+    segment.gender = best_clap_label("gender")
+    segment.quality = best_clap_label("quality")
+    segment.emotion = best_clap_label("emotion")
+    segment.speed = best_clap_label("speed")
+    segment.pitch = best_clap_label("pitch")
+    segment.clarity = best_clap_label("clarity")
+    segment.distance = best_clap_label("distance")
+
+    segment.description = (
+        f"A {segment.age} {segment.gender} native {language} speaker with {segment.quality} voice delivers {segment.emotion} speech "
+        f"with a {segment.speed} speed and {segment.pitch} pitch. The recording is of very high quality, "
+        f"with the speaker's voice sounding {segment.clarity} and {segment.distance}."
+    )
+    return segment
+
+# --------------------------------------------------------------------------
 # Stage 3: transcription + diarization (whispermlx)
 # --------------------------------------------------------------------------
 
 def subs_and_diarize(vocals_16k: Path, workdir: Path, segments, force: bool = False,
                  model_size: str = "large-v3", device: str = "cpu", lang='en',
-                 diarize: bool = True, hf_token: Optional[str] = None) -> List[Segment]:
+                 diarize: bool = True, hf_token: Optional[str] = None,
+                 clap_model:str = None) -> List[Segment]:
     cache = workdir / "transcript_diarized.json"
     if cache.exists() and not force:
         data = json.loads(cache.read_text())
@@ -375,10 +475,17 @@ def subs_and_diarize(vocals_16k: Path, workdir: Path, segments, force: bool = Fa
     )
     diarization = pl(str(vocals_16k))
 
-    # Gender classifer
-    from transformers import pipeline
-    gender_model = "alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech"
-    gender_classifier = pipeline("audio-classification", model=gender_model)
+    # CLAP descriptions
+    if clap_model:
+        from transformers import ClapModel, ClapProcessor
+        desc_model = ClapModel.from_pretrained(clap_model).to(device).eval()
+        desc_processor = ClapProcessor.from_pretrained(clap_model)
+    else:
+        # Gender classifer
+        from transformers import pipeline
+        gender_model = "alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech"
+        gender_classifier = pipeline("audio-classification", model=gender_model)
+
 
     ref_dir = ensure_dir(workdir / "speaker_refs")
     audio, sr = sf.read(str(vocals_16k))
@@ -406,8 +513,11 @@ def subs_and_diarize(vocals_16k: Path, workdir: Path, segments, force: bool = Fa
             new_segments.append(new_seg)
         clip = audio[start_sample:end_sample]
 
-        # Get gender
-        new_seg.gender = gender_classifier(clip)[0]['label']
+        # Get description
+        if clap_model:
+            new_seg = get_clap_description(new_seg, clip, desc_model, desc_processor, device)
+        else:
+            new_seg.gender = gender_classifier(clip)[0]['label']
 
         sf.write(str(ref_path), clip, sr)
 
@@ -415,16 +525,16 @@ def subs_and_diarize(vocals_16k: Path, workdir: Path, segments, force: bool = Fa
         try:
             while True:
                 i+=1
-                log.info(f"{i},{j}, {segments[i]["start"]}, {segments[i]["end"]}")
+                log.info(f'{i},{j}, {segments[i]["start"]}, {segments[i]["end"]}')
                 #mid = (segments[i]["start"] + segments[i]["end"]) / 2
                 if turn.start <= segments[i]["end"]  <= turn.end:
                     try:
-                        new_seg.text_en += f" {segments[i]["text_en"]}"
+                        new_seg.text_en += f' {segments[i]["text_en"]}'
                     except:
                         pass
 
                     try:
-                        new_seg.text_hi += f" {segments[i]["text_hi"]}"
+                        new_seg.text_hi += f' {segments[i]["text_hi"]}'
                     except:
                         pass
                 else:
@@ -444,7 +554,8 @@ def subs_and_diarize(vocals_16k: Path, workdir: Path, segments, force: bool = Fa
 
 def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
                  model_size: str = "large-v3", device: str = "cpu",
-                 diarize: bool = True, hf_token: Optional[str] = None) -> List[Segment]:
+                 diarize: bool = True, hf_token: Optional[str] = None,
+                 clap_model = None) -> List[Segment]:
     cache = workdir / "transcript_diarized.json"
     if cache.exists() and not force:
         data = json.loads(cache.read_text())
@@ -476,13 +587,16 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
         diarize_segments = diarize_model(str(vocals_16k))
         result = whispermlx.assign_word_speakers(diarize_segments, result)
 
-    from transformers import pipeline
-    gender_model = "alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech"
-    gender_classifier = pipeline("audio-classification", model=gender_model) 
-
     segments: List[Segment] = []
     ref_dir = ensure_dir(workdir / "speaker_refs")
     audio, sr = sf.read(str(vocals_16k))
+
+    # Basic Gender classifer
+    if not clap_model:
+        from transformers import pipeline
+        gender_model = "alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech"
+        gender_classifier = pipeline("audio-classification", model=gender_model) 
+    
     for i, seg in enumerate(result["segments"]):
         text = (seg.get("text") or "").strip()
         if not text:
@@ -499,18 +613,19 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
         end_sample = int(min(seg["end"], seg["start"] + 8.0) * sr)
         clip = audio[start_sample:end_sample]
 
-        # Get gender
-        results = gender_classifier(clip)
+        new_seg = Segment(
+            index=i, start=float(seg["start"]), end=float(seg["end"]),
+            speaker=speaker or "SPEAKER_00", text_en=text,
+            ref_audio_path = str(ref_path)
+        )
+        # Get description
+        if not clap_model:
+            new_seg.gender = gender_classifier(clip)[0]['label']
 
         # Write audio
         sf.write(str(ref_path), clip, sr)
         # Finalized segment
-        segments.append(Segment(
-            index=i, start=float(seg["start"]), end=float(seg["end"]),
-            speaker=speaker or "SPEAKER_00", text_en=text,
-            ref_audio_path = str(ref_path), gender=results[0]['label']
-        ))
-
+        segments.append(new_seg)
 
     cache.write_text(json.dumps([asdict(s) for s in segments], indent=2))
     log.info("Final: %d segments across %d speakers", len(segments),
@@ -518,84 +633,25 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
     return segments
 
 
-# --------------------------------------------------------------------------
-# Stage 4a: optional gender/age classification (wav2vec2, audeering)
-# --------------------------------------------------------------------------
-
-def _load_age_gender_model(device: str):
-    import torch.nn as nn
-    from transformers import Wav2Vec2Processor
-    from transformers.models.wav2vec2.modeling_wav2vec2 import Wav2Vec2Model, Wav2Vec2PreTrainedModel
-
-    class ModelHead(nn.Module):
-        def __init__(self, config, num_labels):
-            super().__init__()
-            self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-            self.dropout = nn.Dropout(config.final_dropout)
-            self.out_proj = nn.Linear(config.hidden_size, num_labels)
-
-        def forward(self, features):
-            x = self.dropout(features)
-            x = torch.tanh(self.dense(x))
-            x = self.dropout(x)
-            return self.out_proj(x)
-
-    class AgeGenderModel(Wav2Vec2PreTrainedModel):
-        def __init__(self, config):
-            super().__init__(config)
-            self.wav2vec2 = Wav2Vec2Model(config)
-            self.age = ModelHead(config, 1)
-            self.gender = ModelHead(config, 3)
-            self.init_weights()
-            self.post_init()
-
-        def forward(self, input_values):
-            hidden_states = self.wav2vec2(input_values)[0]
-            pooled = torch.mean(hidden_states, dim=1)
-            logits_age = self.age(pooled)
-            logits_gender = torch.softmax(self.gender(pooled), dim=1)
-            return pooled, logits_age, logits_gender
-
-    name = "audeering/wav2vec2-large-robust-24-ft-age-gender"
-    processor = Wav2Vec2Processor.from_pretrained(name)
-    model = AgeGenderModel.from_pretrained(name).to(device).eval()
-    return processor, model
-
-def classify_age_gender(segments: List[Segment], vocals_16k: Path, workdir: Path,
-                          force: bool = False, device: str = "cpu") -> List[Segment]:
-    import numpy as np
-
-    cache = workdir / "age_gender.json"
+def build_clap_profiles(segments, vocals_wav, workdir, clap_model:str, device = 'mps', language='hindi', force=False):
+    cache = workdir / "transcript_clap.json"
     if cache.exists() and not force:
-        cached = {s["index"]: s for s in json.loads(cache.read_text())}
-        for seg in segments:
-            if seg.index in cached:
-                seg.gender = cached[seg.index]["gender"]
-                seg.age_years = cached[seg.index]["age_years"]
-        return segments
+        data = json.loads(cache.read_text())
+        return [Segment(**s) for s in data]
+    # CLAP descriptions
+    from transformers import ClapModel, ClapProcessor
+    desc_model = ClapModel.from_pretrained(clap_model).to(device).eval()
+    desc_processor = ClapProcessor.from_pretrained(clap_model)
+    audio_48k, _ = librosa.load(str(vocals_wav), sr = 48000)
 
-    processor, model = _load_age_gender_model(device)
-    audio, sr = sf.read(str(vocals_16k))
-    gender_labels = ["child", "female", "male"]
+    for new_seg in segments:
+        # Get description
+            clip_48k = audio_48k[int(new_seg.start * 48000):int(new_seg.end*48000)]
+            new_seg = get_clap_description(new_seg, clip_48k, desc_model, desc_processor, device, language)
 
-    results = []
-    for seg in segments:
-        chunk = audio[int(seg.start * sr):int(seg.end * sr)]
-        if len(chunk) < sr * 0.3:
-            continue
-        inputs = processor(chunk, sampling_rate=sr, return_tensors="pt")
-        input_values = inputs["input_values"].to(device)
-        with torch.no_grad():
-            _, logits_age, logits_gender = model(input_values)
-        seg.age_years = int(logits_age.cpu().numpy().squeeze()*10) * 10.0
-        seg.gender = gender_labels[int(np.argmax(logits_gender.cpu().numpy()))]
-        log.info(f"{seg.gender} : {seg.text_en}")
-        results.append({"index": seg.index, "gender": seg.gender, "age_years": seg.age_years})
-
-    cache.write_text(json.dumps(results, indent=2))
+    cache.write_text(json.dumps([asdict(s) for s in segments], indent=2))
     return segments
-
-
+            
 # --------------------------------------------------------------------------
 # Stage 4b: optional emotion classification (wav2vec2)
 # --------------------------------------------------------------------------
@@ -623,8 +679,6 @@ def classify_emotion(segments: List[Segment], vocals_16k: Path, workdir: Path,
 
     if backend == "categorical":
         from transformers import pipeline
-        #clf = pipeline("audio-classification", model="superb/wav2vec2-base-superb-er", device=device if device != "mps" else -1)
-        #label_map = {"neu": "neutral", "hap": "happy", "ang": "angry", "sad": "sad"}
         clf = pipeline("audio-classification", model="ehcalabres/wav2vec2-lg-xlsr-en-speech-emotion-recognition", device=device if device != "mps" else -1)
         label_map = {v:v for v in ['angry', 'calm', 'disgust', 'fearful', 'happy', 'neutral', 'sad', 'surprised']}
         for seg in segments:
@@ -946,62 +1000,14 @@ HINDI_PARLER_PRESETS = {
 }
 
 
-def build_speaker_profiles(segments: List[Segment], workdir: Path,
-                             override_path: Optional[Path] = None) -> Dict[str, SpeakerProfile]:
-    by_speaker: Dict[str, List[Segment]] = defaultdict(list)
-    samples: Dict[str, List[str]] = defaultdict(list)
-    for seg in segments:
-        by_speaker[seg.speaker].append(seg)
-        samples[seg.speaker].append(seg.ref_audio_path)
-
-    overrides = {}
-    if override_path and override_path.exists():
-        overrides = json.loads(override_path.read_text())
-
-    profiles: Dict[str, SpeakerProfile] = {}
-    preset_cursor = {"male": 0, "female": 0, "child": 0}
-
-    for speaker_id, segs in sorted(by_speaker.items()):
-        genders = Counter(s.gender for s in segs if s.gender)
-        gender = genders.most_common(1)[0][0] if genders else "male"
-        emotions = Counter(s.emotion for s in segs if s.emotion)
-        dominant_emotion = emotions.most_common(1)[0][0] if emotions else "neutral"
-        ages = [s.age_years for s in segs if s.age_years]
-        mean_age = sum(ages) / len(ages) if ages else 30.0
-        pitches = [s.pitch_hz for s in segs if s.pitch_hz]
-        mean_pitch = sum(pitches) / len(pitches) if pitches else 130.0
-        speeds = [s.speed_wps for s in segs if s.speed_wps]
-        mean_speed = sum(speeds) / len(speeds) if speeds else 2.5
-
-        if speaker_id in overrides and "parler_preset" in overrides[speaker_id]:
-            preset = overrides[speaker_id]["parler_preset"]
-        else:
-            pool = HINDI_PARLER_PRESETS.get(gender, HINDI_PARLER_PRESETS["male"])
-            preset = pool[preset_cursor[gender] % len(pool)]
-            preset_cursor[gender] += 1
-
-        profiles[speaker_id] = SpeakerProfile(
-            speaker_id=speaker_id, gender=gender, age_years=mean_age,
-            dominant_emotion=dominant_emotion, mean_pitch_hz=mean_pitch,
-            mean_speed_wps=mean_speed, parler_preset=preset,
-        )
-        log.info("Speaker %s -> gender=%s age=%.0f emotion=%s preset=%s (%d segments)",
-                  speaker_id, gender, mean_age, dominant_emotion, preset, len(segs))
-
-    (workdir / "speaker_profiles.json").write_text(
-        json.dumps({k: asdict(v) for k, v in profiles.items()}, indent=2, ensure_ascii=False)
-    )
-    return profiles
-
-
-def build_parler_description(seg: Segment, profile: SpeakerProfile) -> str:
+def build_parler_description(seg: Segment) -> str:
     """Composes a natural-language caption per Indic Parler-TTS's documented
     controls: named speaker + pitch + speaking rate + expressivity/emotion
     + recording quality. Pitch/rate thresholds are simple heuristics --
     tune them by ear against your source material."""
-    pitch = seg.pitch_hz or profile.mean_pitch_hz
-    speed = seg.speed_wps or profile.mean_speed_wps
-    emotion = seg.emotion or profile.dominant_emotion
+    pitch = seg.pitch_hz
+    speed = seg.speed_wps
+    emotion = seg.emotion
 
     pitch_adj = "low-pitched" if pitch < 110 else ("high-pitched" if pitch > 200 else "moderately pitched")
     rate_adj = "slow-paced" if speed < 2.0 else ("moderately fast-paced" if speed > 3.2 else "moderately paced")
@@ -1011,10 +1017,11 @@ def build_parler_description(seg: Segment, profile: SpeakerProfile) -> str:
     }.get(emotion, "conversational")
 
     return (
-        f"{profile.parler_preset}'s voice is {pitch_adj} and {rate_adj}, delivered in a "
+        f"{HINDI_PARLER_PRESETS[seg.gender][0]}'s voice is {pitch_adj} and {rate_adj}, delivered in a "
         f"{emotion_adj} tone. The recording is very clear and close-sounding, with no "
         f"background noise."
     )
+
 
 # Voice clone profiles
 def build_speaker_ref_profiles(segments: List[Segment], workdir: Path,
@@ -1034,14 +1041,17 @@ def build_speaker_ref_profiles(segments: List[Segment], workdir: Path,
 # Stage 7a: TTS Method A -- Indic Parler-TTS
 # --------------------------------------------------------------------------
 
-def synth_parler(segments: List[Segment], profiles: Dict[str, SpeakerProfile],
-                   workdir: Path, force: bool = False, device: str = "cpu") -> List[Segment]:
+def synth_parler(segments: List[Segment], workdir: Path, force: bool = False, 
+                 model_name = "ai4bharat/indic-parler-tts", device: str = "cpu") -> List[Segment]:
     from parler_tts import ParlerTTSForConditionalGeneration
     from transformers import AutoTokenizer
+    import json
 
     out_dir = ensure_dir(workdir / "tts_parler")
-    model = ParlerTTSForConditionalGeneration.from_pretrained("ai4bharat/indic-parler-tts").to(device)
-    tokenizer = AutoTokenizer.from_pretrained("ai4bharat/indic-parler-tts")
+    model = ParlerTTSForConditionalGeneration.from_pretrained(
+        model_name,
+    ).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     description_tokenizer = AutoTokenizer.from_pretrained(model.config.text_encoder._name_or_path)
 
     for seg in segments:
@@ -1049,10 +1059,11 @@ def synth_parler(segments: List[Segment], profiles: Dict[str, SpeakerProfile],
         if out_path.exists() and not force:
             seg.tts_audio_path = str(out_path)
             continue
-        profile = profiles[seg.speaker]
-        description = build_parler_description(seg, profile)
 
-        desc_ids = description_tokenizer(description, return_tensors="pt").to(device)
+        if not seg.description:
+            seg.description = build_parler_description(seg)
+
+        desc_ids = description_tokenizer(seg.description, return_tensors="pt").to(device)
         prompt_ids = tokenizer(seg.text_hi, return_tensors="pt").to(device)
         with torch.no_grad():
             generation = model.generate(
@@ -1062,10 +1073,9 @@ def synth_parler(segments: List[Segment], profiles: Dict[str, SpeakerProfile],
         audio_arr = generation.cpu().numpy().squeeze()
         sf.write(str(out_path), audio_arr, model.config.sampling_rate)
         seg.tts_audio_path = str(out_path)
-        log.info("[%d] Parler synth via %s: %s", seg.index, profile.parler_preset, description)
+        log.info("[%d] Parler synth : %s", seg.index, seg.description)
 
     return segments
-
 
 # --------------------------------------------------------------------------
 # Stage 7b: TTS Method B -- IndicF5 voice cloning (self-reference)
@@ -1164,11 +1174,6 @@ def synth_coqui(segments: List[Segment], profiles: Dict[str, List[str]],
                         gpt_cond_len = gpt_cond_len)
             except:
                 shutil.copy(seg.ref_audio_path, out_path)
-                #tts.tts_to_file(text=seg.text_hi[:20],
-                #        file_path=out_path,
-                #        speaker_wav=seg.ref_audio_path,
-                #        language="hi",
-                #        gpt_cond_len = gpt_cond_len)
         seg.tts_audio_path = str(out_path)
     return segments
 
@@ -1499,6 +1504,7 @@ def main():
     ap.add_argument("--translator", default="indictrans2", choices=["indictrans2", "nllb", "mlx", "sarvam"])
 
     ap.add_argument("--tts-method", required=True, choices=["parler", "clone", 'coqui'])
+    ap.add_argument("--clap-model", action='store_true')
     ap.add_argument("--speaker-overrides", type=Path, default=None,
                      help="JSON: {\"SPEAKER_00\": {\"parler_preset\": \"Rohit\"}} to manually pin presets")
     ap.add_argument("--f5-ref-max-seconds", type=float, default=6.0)
@@ -1515,6 +1521,7 @@ def main():
     # Slow down video a bit, helps with language transition - hindi is slower
     args.input = slowdown(args.input, args.slowdown, workdir)
 
+    # Subtitles - mostly not used right now
     sub = None
     segments=None
     need_translate = True
@@ -1530,16 +1537,23 @@ def main():
             need_translate = False
         segments = read_subs_as_whisper_segments(sub_file, lang)
 
+    # Separate audio
     stereo_wav, _mono_unused = extract_audio(args.input, workdir, force=args.force)
     vocals_wav, background_wav, vocals_16k, vol = separate_vocals(
         stereo_wav, workdir, force=args.force, device=device, model=args.demucs_model
     )
 
+    if args.clap_model:
+        clap_model= 'laion/larger_clap_general'
+    else:
+        clap_model = None
+
     # Subtitle created segments
     if segments:
         segments = subs_and_diarize(
-            vocals_16k, workdir, segments, force=args.force, model_size=args.whisper_model,
+            vocals_16k, vocals_wav, workdir, segments, force=args.force, model_size=args.whisper_model,
             device=device, diarize=not args.no_diarize, hf_token=args.hf_token,
+            clap_model=clap_model
         )
 
     if not segments:
@@ -1547,14 +1561,12 @@ def main():
         segments = transcribe_and_diarize(
             vocals_16k, workdir, force=args.force, model_size=args.whisper_model,
             device=device, diarize=not args.no_diarize, hf_token=args.hf_token,
+            clap_model=clap_model
         )
 
     if not segments:
         log.error("No speech detected -- aborting.")
         sys.exit(1)
-
-    #if not args.no_detect_age_gender:
-    #    segments = classify_age_gender(segments, vocals_16k, workdir, force=args.force, device=device)
 
     if need_translate:
         if args.translator == "indictrans2":
@@ -1575,16 +1587,16 @@ def main():
 
     segments = extract_pitch_and_speed(segments, vocals_16k) 
     if args.tts_method == "parler":
-        if not args.no_detect_emotion:
+        if clap_model:
+            segments = build_clap_profiles(segments, vocals_wav, workdir, clap_model, device, lang_ref[lang][-1], args.force)
+        elif not args.no_detect_emotion:
             segments = classify_emotion(segments, vocals_16k, workdir, force=args.force,
                                           device=device, backend=args.emotion_backend)
-         # always runs; also fills gender fallback
-        profiles = build_speaker_profiles(segments, workdir, override_path=args.speaker_overrides)
+            for seg in segments:
+                if seg.emotion is None:
+                    seg.emotion = "neutral"
 
-        for seg in segments:
-            if seg.emotion is None:
-                seg.emotion = "neutral"
-        segments = synth_parler(segments, profiles, workdir, force=args.force, device=device)
+        segments = synth_parler(segments, workdir, force=args.force, device=device)
     else:
         # Collect coice samples
         profiles = build_speaker_ref_profiles(segments, workdir, override_path=args.speaker_overrides)

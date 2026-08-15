@@ -25,7 +25,8 @@ understanding what you are doing. You can also add finetuned models yourselves, 
 
 ## In Progress
 - Voice LORA support
-- Speaker classification
+- Speaker classification / clustering
+- Code Refactoring into a library
 - Alignment improvement
 - Prosody transfer (open problem)
 - Scripts for model/library setup

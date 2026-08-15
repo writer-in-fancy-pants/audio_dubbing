@@ -156,11 +156,12 @@ def get_audio_files_in_dir(loc:Path)-> List[Path]:
         if file.is_file() and file.suffix.lower() in audio_extensions
     ])
 
-def get_speaker_mapping(speakers_dir = Path("./speakers")):
+def get_speaker_mapping(speakers_dir = Path("./speakers"), use_from_source = False):
     speaker_mapping = {}
-    for spk_cls in speakers_dir.iterdir():
-        if spk_cls.is_dir():
-            speaker_mapping[spk_cls.name.lower()]  = get_audio_files_in_dir(spk_cls)
+    if not use_from_source:
+        for spk_cls in speakers_dir.iterdir():
+            if spk_cls.is_dir():
+                speaker_mapping = [(spk_cls.name.lower(), id) for id in get_audio_files_in_dir(spk_cls)]
     return speaker_mapping
 
 # --------------------------------------------------------------------------
@@ -254,7 +255,9 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
                  model_size: str = "large-v3", device: str = "cpu",
                  diarize: bool = True, hf_token: Optional[str] = None) -> List[Segment]:
     cache = workdir / "transcript_diarized.json"
+    ref_dir = ensure_dir(workdir / "speaker_refs")
     if cache.exists() and not force:
+        shutil.copytree(ref_dir, f"./raw_audio/{workdir.name}")
         data = json.loads(cache.read_text())
         return [Segment(**s) for s in data]
 
@@ -289,7 +292,7 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
     gender_classifier = pipeline("audio-classification", model=gender_model) 
 
     segments: List[Segment] = []
-    ref_dir = ensure_dir(workdir / "speaker_refs")
+    
     audio, sr = sf.read(str(vocals_16k))
     for i, seg in enumerate(result["segments"]):
         text = (seg.get("text") or "").strip()
@@ -328,20 +331,36 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
         ))
 
     cache.write_text(json.dumps([asdict(s) for s in segments], indent=2))
+    shutil.copytree(ref_dir, f"./raw_audio/{workdir.name}")
     log.info("Final: %d segments across %d speakers", len(segments),
               len({s.speaker for s in segments}))
     return segments
 
 
-def build_speaker_reference(segments: List[Segment], spk_map = {}) -> List[Segment]:
+def build_speaker_reference(segments: List[Segment], spk_map = {}, use_originals = False, 
+                            min_audio_duration = 3.0, max_audios = 6) -> List[Segment]:
     """Speaker references."""
+    if use_originals:
+        from heapq import heappush, heappop
+        import random
+        speaker_thresh = defaultdict(min_audio_duration)
+        speakers = defaultdict([])
+        for seg in segments:
+            dur = seg.end - seg.start
+            if speaker_thresh[seg.speaker][0] < dur:
+                heappush(speakers[seg.speaker], (dur, seg.ref_audio_path))
+                if len(speakers[seg.speaker]) >max_audios:
+                    heappop(speakers[seg.speaker])
+        # Returning randomly chosen the list of longest phrases
+        spk_map = {k:(seg.gender, random.choice(list(zip(*v))[1])) for k, v in speakers.items()}
+
     for seg in segments:
-        try:
+        if spk_map != {}:
             # If speaker examples provided, loops over the available voices for different speakers
-            seg.ref_audio_path = spk_map[seg.gender][seg.speaker % len(spk_map[seg.gender])]
-        except:
-            # Keep the original audio as speaker reference
-            pass
+            try:
+                seg.ref_audio_path = spk_map[(seg.gender, seg.speaker % len(spk_map[seg.gender]))]
+            except:
+                pass
     return segments
 
 
@@ -363,6 +382,15 @@ def direct_s2st(vocals_wav: Path, segments: List[Segment], workdir: Path,
     model_name = "facebook/seamless-m4t-v2-large"
     processor = AutoProcessor.from_pretrained(model_name)
     model = SeamlessM4Tv2Model.from_pretrained(model_name).to(device)
+    generation_config = {
+        "tgt_lang": "hin",
+        "generate_speech":True,
+        # Reduce repetition, improve quality
+        "repetition_penalty": 1.2,
+        "no_repeat_ngram_size": 4,
+        "length_penalty": 1.0,
+        "temperature" : 0.6,
+    }
 
     new_sr = 16000
     audio, sr = torchaudio.load(vocals_wav)
@@ -388,8 +416,9 @@ def direct_s2st(vocals_wav: Path, segments: List[Segment], workdir: Path,
 
             inputs = processor(audio=chunk, sampling_rate=new_sr, return_tensors="pt").to(device)
             with torch.no_grad():
-                output = model.generate(**inputs, tgt_lang="hin", 
-                                        generate_speech=True, speaker_id = seg.speaker)
+                output = model.generate(**inputs, speaker_id = seg.speaker, 
+                                        max_new_tokens= min(len(seg.text_en), 50),
+                                        **generation_config) 
 
             waveform = output[0][0].cpu().numpy().squeeze()
             sf.write(str(out_path), waveform, model.config.sampling_rate)
@@ -403,11 +432,6 @@ def direct_s2st(vocals_wav: Path, segments: List[Segment], workdir: Path,
 # --------------------------------------------------------------------------
 # Stage 5: Voice style transfer (OpenVoice tone-color conversion)
 # --------------------------------------------------------------------------
-
-#def voice_style_transfer(segments: List[Segment], workdir: Path, force: bool = False,
-#                           device: str = "cpu", checkpoint_dir: str = "checkpoints_v2") -> List[Segment]:
-#    from voxcpm import VoxCPM
-#    model = VoxCPM.from_pretrained("openbmb/VoxCPM2")
 
 def voice_style_transfer(segments: List[Segment], workdir: Path, force: bool = False,
                            device: str = "cpu", checkpoint_dir: str = "checkpoints_v2") -> List[Segment]:
@@ -500,7 +524,6 @@ def time_stretch(in_path: Path, out_path: Path, factor: float):
         "-filter:a", f"atempo={factor:.4f}",
         str(out_path),
     ])
-
 
 def align_segments(segments: List[Segment], workdir: Path, force: bool = False,
                     max_stretch: float = 1.6) -> List[Segment]:
@@ -731,20 +754,22 @@ def main():
     ap.add_argument("--hf-token", default=None, help="required for whispermlx diarization (pyannote gated model)")
     ap.add_argument("--demucs-model", default="htdemucs")
     ap.add_argument("--diarize", action="store_true")
+    ap.add_argument("--no-voice-cloning", action="store_true")
     ap.add_argument("--openvoice-checkpoints", default="checkpoints_v2",
                      help="path to downloaded OpenVoice V2 checkpoint directory")
     ap.add_argument("--max-segment-len", type=float, default=12.0,
                      help="max seconds per VAD-detected chunk fed to S2ST")
     ap.add_argument("--vc", default="chatterbox", choices=["openvoice", "chatterbox"])
     ap.add_argument("--speakers-dir", default=Path("./speakers"), help="Directory for dubbing voices")
+    ap.add_argument("--original-speakers", action='store_true', help="Use voices from the speaker in the video")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
     workdir = ensure_dir(args.workdir)
     log.info("Working directory: %s", workdir.resolve())
 
-    # 0 speaker mapping
-    spk_map = get_speaker_mapping(Path(args.speakers_dir))
+    # 0. Speaker mapping -> Dict {(speaker_category, speaker_id) : speaker_reference_filepath}
+    spk_map = get_speaker_mapping(Path(args.speakers_dir), args.original_speakers)
 
     # 1. extract
     audio_wav = extract_audio(args.input, workdir / "source_audio.wav", force=args.force)
@@ -772,12 +797,17 @@ def main():
     segments = direct_s2st(vocals_wav, segments, workdir, force=args.force, device=args.device)
 
     # 5. voice style transfer onto the original speaker's timbre
-    segments = build_speaker_reference(segments, spk_map)
-    if args.vc == "chatterbox":
-        segments = voice_style_transfer_chatterbox(segments, workdir, force=args.force, device=args.device)
+    if not args.no_voice_cloning:
+        segments = build_speaker_reference(segments, spk_map)
+
+        if args.vc == "chatterbox":
+            segments = voice_style_transfer_chatterbox(segments, workdir, force=args.force, device=args.device)
+        else:
+            segments = voice_style_transfer(segments, workdir, force=args.force, device=args.device,
+                                                checkpoint_dir=args.openvoice_checkpoints)
     else:
-        segments = voice_style_transfer(segments, workdir, force=args.force, device=args.device,
-                                              checkpoint_dir=args.openvoice_checkpoints)
+        for seg in segments:
+            seg.styled_audio_path = seg.s2st_audio_path
 
     # 6. align to original timing
     segments = align_segments(segments, workdir, force=args.force)
