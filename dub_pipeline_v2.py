@@ -419,7 +419,7 @@ def extract_tensor(output) -> torch.Tensor:
 
 @torch.no_grad()
 def get_audio_embedding(audio, model, processor, device) -> torch.Tensor:
-    inputs = processor(audios=audio, sampling_rate=48000, return_tensors="pt").to(device)
+    inputs = processor(audio=audio, sampling_rate=48000, return_tensors="pt").to(device)
     audio_embed = extract_tensor(model.get_audio_features(**inputs))
     return audio_embed / audio_embed.norm(dim=-1, keepdim=True)
 

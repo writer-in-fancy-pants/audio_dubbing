@@ -16,16 +16,20 @@ understanding what you are doing. You can also add finetuned models yourselves, 
 - Speech to speech translation - Seamless M4T + ChatterboxVC
 - Text translation (nllb, gemma, sarvam, indictrans2)
 - Emotion, gender detection
-- F5-voice cloning using ai4bharat models
 - Voice cloning Coqui XTTS v2 (preferred)
+- F5-voice cloning using ai4bharat models
+- CLAP based speech classification
+- Instruction guided Parler TTS
 - Removing voice artefacts, normalizing
 - integrate audio track into the video
 - Autoconfiguring speaker references
 - English to Hindi dubbing
+- Run script with presets
 
 ## In Progress
 - Voice LORA support
 - Speaker classification / clustering
+- Config and constants stored seperately, easy to edit
 - Code Refactoring into a library
 - Alignment improvement
 - Prosody transfer (open problem)
@@ -142,7 +146,7 @@ I have only tested on M1 mac for English to Hindi dubbing. I will be uploading s
 Also slows down the video, suitable for shows with a lot of dialog since Hindi has more words on an average, and takes longer time.
 ```bash
 python dub_pipeline_v2.py \
-  --input ./output.mkv\
+  --input ./output.mkv \
   --output ./output_dubbed.mkv \
   --workdir ./work_output \
   --device mps \
@@ -151,6 +155,11 @@ python dub_pipeline_v2.py \
   --no-use-subs \
   --translator sarvam \
   --slowdown 0.9 --force
+```
+
+or, use default presets
+```bash
+./run_dubbing.sh <input_path> <output_path> <work_directory_for_intermediate_files>
 ```
 
 ### Whisper (with diarization) -> SeamlessM4T -> ChatterboxVC

@@ -5,9 +5,14 @@ numpy>=1.24
 librosa>=0.10.0
 torchaudio>=2.1.0
 torchcodec
+transformers
+sentencepiece
 
 # Stage 2: source separation
 demucs>=4.0.1
+
+# CLAP embeddings
+
 
 # Stage 3: transcription
 faster-whisper>=1.0.0
@@ -23,7 +28,9 @@ indictranstoolkit
 
 # Stage 6: voice-cloned TTS
 coqui-tts             # Coqui TTS (provides XTTS-v2)
+git+https://github.com/writer-in-fancy-pants/parler-tts.git
 
 # Others
 pysrt
+pydub
 
