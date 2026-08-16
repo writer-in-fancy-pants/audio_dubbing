@@ -25,6 +25,7 @@ understanding what you are doing. You can also add finetuned models yourselves, 
 - Autoconfiguring speaker references
 - English to Hindi dubbing
 - Run script with presets
+- Voxtral TTS support
 
 ## In Progress
 - Voice LORA support
@@ -37,6 +38,7 @@ understanding what you are doing. You can also add finetuned models yourselves, 
 - Multilingual dubbing
 - Test audio examples for reference
 - Widget / GUI for audio comparison
+- Add F5 mlx support
 
 
 # Video Dubbing Pipeline

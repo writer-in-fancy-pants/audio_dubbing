@@ -336,6 +336,35 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
               len({s.speaker for s in segments}))
     return segments
 
+# --------------------------------------------------------------------------
+# Stage 3.5: Identifying speakers, getting reference clips
+# --------------------------------------------------------------------------
+
+def extract_pitch_and_speed(segments: List[Segment], vocals_16k: Path) -> List[Segment]:
+    audio, sr = sf.read(str(vocals_16k))
+    for seg in segments:
+        chunk = audio[int(seg.start * sr):int(seg.end * sr)]
+        duration = max(seg.end - seg.start, 0.01)
+        seg.speed_wps = len(seg.text_in.split()) / duration
+
+        if len(chunk) < sr * 0.2:
+            seg.pitch_hz = 130.0
+            continue
+        try:
+            f0, voiced_flag, _ = librosa.pyin(
+                chunk.astype(np.float32), fmin=60, fmax=400, sr=sr
+            )
+            voiced_f0 = f0[voiced_flag] if voiced_flag is not None else f0[~np.isnan(f0)]
+            voiced_f0 = voiced_f0[~np.isnan(voiced_f0)] if voiced_f0 is not None else []
+            seg.pitch_hz = float(np.median(voiced_f0)) if len(voiced_f0) else 130.0
+        except Exception as e:
+            log.warning("pyin failed on segment %d (%s); defaulting pitch", seg.index, e)
+            seg.pitch_hz = 130.0
+
+        # gender heuristic fallback, only used if gender wasn't classified
+        if seg.gender is None:
+            seg.gender = "female" if seg.pitch_hz > 175 else "male"
+    return segments
 
 def build_speaker_reference(segments: List[Segment], spk_map = {}, use_originals = False, 
                             min_audio_duration = 3.0, max_audios = 6) -> List[Segment]:

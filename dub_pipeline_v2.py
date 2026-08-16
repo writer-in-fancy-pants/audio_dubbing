@@ -128,11 +128,11 @@ REQUIREMENTS
 
 USAGE
     python dub_pipeline_s2t2s.py \\
-        --input movie.mp4 --output movie.hindi_dubbed.mp4 \\
+        --input movie.mp4 --output movie.target_dubbed.mp4 \\
         --workdir ./work --tts-method clone --hf-token hf_xxx
 
     python dub_pipeline_s2t2s.py \\
-        --input movie.mp4 --output movie.hindi_dubbed.mp4 \\
+        --input movie.mp4 --output movie.target_dubbed.mp4 \\
         --workdir ./work --tts-method parler --hf-token hf_xxx
 """
 
@@ -194,8 +194,8 @@ SPEECH_CATEGORIES = {
 }
 
 lang_ref ={
-    'en':['eng', 'en', 'english'],
-    'hi':['hin', 'hi', 'hindi']
+    'en':['eng', "eng_Latn", 'en', 'english'],
+    'hi':['hin', "hin_Deva", 'hi', 'hindi']
 }
 
 # --------------------------------------------------------------------------
@@ -208,8 +208,8 @@ class Segment:
     start: float
     end: float
     speaker: str = "SPEAKER_00"
-    text_en: str = ""
-    text_hi: Optional[str] = None
+    text_in: str = ""
+    text_out: Optional[str] = None
 
     # CLAP based
     description: Optional[str] = None
@@ -231,8 +231,9 @@ class Segment:
     pitch_hz: Optional[float] = None
     speed_wps: Optional[float] = None      # words per second
 
-    ref_audio_path: Optional[str] = None   # this segment's own clean EN clip (Method B)
+    audio_path: Optional[str] = None   # this segment's own clean EN clip (Method B)
     tts_audio_path: Optional[str] = None
+    ref_audio_path: Optional[str] = None   # in case multiple tts engines are used before voice cloning
     aligned_audio_path: Optional[str] = None
 
 
@@ -261,9 +262,16 @@ def resolve_device(requested: str) -> str:
     if requested == "cuda" and not torch.cuda.is_available():
         log.warning("CUDA requested but unavailable, falling back to CPU")
         return "cpu"
-    if requested == "mps" and not torch.backends.mps.is_available():
-        log.warning("MPS requested but unavailable, falling back to CPU")
-        return "cpu"
+    if requested == "mps":
+        if not torch.backends.mps.is_available():
+            log.warning("MPS requested but unavailable, falling back to CPU")
+            return "cpu"
+        #else:
+            # MPS device, set mlx memory limits
+            # import mlx.core as mx
+            # mx.metal.set_memory_limit(40*1024**3) # 40 GB
+            # mx.metal.set_wired_limit(36*1024**3)  # 36 GB
+            # mx.metal.set_cache_limit(512 *1024**2)# 512MB 
     return requested
 
 
@@ -370,7 +378,7 @@ def extract_embedded_subtitles(video_path, output_srt_path, stream_index=0, lang
     return output_srt_path
 
 
-def read_subs_as_whisper_segments(sub_file, lang='hi'):
+def read_subs_as_whisper_segments(sub_file, stype='out'):
     try:
         import pysrt
         subtitles = pysrt.open(sub_file)
@@ -394,7 +402,7 @@ def read_subs_as_whisper_segments(sub_file, lang='hi'):
             segment = {
                 "start": start_seconds,
                 "end": end_seconds,
-                f"text_{lang}": sub.text.replace("\n", " ")
+                f"text_{stype}": sub.text.replace("\n", " ")
             }
             segments.append(segment)
         return segments
@@ -459,12 +467,50 @@ def get_clap_description(segment, audio, model, processor, device='mps', languag
 # --------------------------------------------------------------------------
 # Stage 3: transcription + diarization (whispermlx)
 # --------------------------------------------------------------------------
+def subs_only_transcription(vocals_16k: Path, workdir: Path, segments, force: bool = False, stype='in') -> List[Segment]:
+    cache = workdir / "transcript_subs.json"
+    if cache.exists() and not force:
+        data = json.loads(cache.read_text())
+        return [Segment(**s) for s in data]
+
+    # Gender classifer
+    from transformers import pipeline
+    gender_model = "alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech"
+    gender_classifier = pipeline("audio-classification", model=gender_model)
+
+    ref_dir = ensure_dir(workdir / "speaker_refs")
+    audio, sr = sf.read(str(vocals_16k))
+
+    new_segments: List[Segment] = []
+    for j, seg in enumerate(segments):
+        ref_path = ref_dir / f"seg_{j}.wav"
+        start_sample = int(seg["start"] * sr)
+        end_sample = int(seg["end"] * sr)
+        if end_sample > len(audio):
+            seg["end"] = len(audio)/sr
+        clip = audio[start_sample:end_sample]
+
+        # Use the sound within the subtitle as the generator
+        new_seg = Segment(
+            index=j, start=float(seg["start"]), end=float(seg["end"]),
+            speaker=None, 
+            text_in=seg.get("text_in", ""),
+            text_out=seg.get("text_out", None),
+            audio_path = str(ref_path), ref_audio_path = str(ref_path),
+            gender=gender_classifier(clip)[0]['label']
+        )
+        sf.write(new_seg.audio_path, clip, sr)
+        new_segments.append(new_seg)
+
+    if new_segments:
+        cache.write_text(json.dumps([asdict(s) for s in new_segments], indent=2))
+    return new_segments
+
 
 def subs_and_diarize(vocals_16k: Path, workdir: Path, segments, force: bool = False,
-                 model_size: str = "large-v3", device: str = "cpu", lang='en',
-                 diarize: bool = True, hf_token: Optional[str] = None,
+                 device: str = "cpu", stype='in', hf_token: Optional[str] = None,
                  clap_model:str = None) -> List[Segment]:
-    cache = workdir / "transcript_diarized.json"
+    cache = workdir / "transcript_subs.json"
     if cache.exists() and not force:
         data = json.loads(cache.read_text())
         return [Segment(**s) for s in data]
@@ -486,7 +532,6 @@ def subs_and_diarize(vocals_16k: Path, workdir: Path, segments, force: bool = Fa
         gender_model = "alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech"
         gender_classifier = pipeline("audio-classification", model=gender_model)
 
-
     ref_dir = ensure_dir(workdir / "speaker_refs")
     audio, sr = sf.read(str(vocals_16k))
 
@@ -500,9 +545,9 @@ def subs_and_diarize(vocals_16k: Path, workdir: Path, segments, force: bool = Fa
         new_seg = Segment(
             index=j, start=float(turn.start), end=float(turn.end),
             speaker=spk or "SPEAKER_00", 
-            text_en=segments[i].get("text_end", ""),
-            text_hi=segments[i].get("text_hi", ""),
-            ref_audio_path = str(ref_path), gender="Male"
+            text_in=segments[i].get("text_in", ""),
+            text_out=segments[i].get("text_out", ""),
+            audio_path = str(ref_path), gender="Male"
         )
 
         # Write audio
@@ -510,7 +555,7 @@ def subs_and_diarize(vocals_16k: Path, workdir: Path, segments, force: bool = Fa
         end_sample = int(min(turn.end, turn.start + 8.0) * sr)
         if end_sample > len(audio):
             new_seg.end = len(audio)/sr
-            new_segments.append(new_seg)
+            # new_segments.append(new_seg)
         clip = audio[start_sample:end_sample]
 
         # Get description
@@ -520,26 +565,26 @@ def subs_and_diarize(vocals_16k: Path, workdir: Path, segments, force: bool = Fa
             new_seg.gender = gender_classifier(clip)[0]['label']
 
         sf.write(str(ref_path), clip, sr)
-
         # Build text from sub segments
         try:
             while True:
                 i+=1
                 log.info(f'{i},{j}, {segments[i]["start"]}, {segments[i]["end"]}')
-                #mid = (segments[i]["start"] + segments[i]["end"]) / 2
+                mid = (segments[i]["start"] + segments[i]["end"]) / 2
                 if turn.start <= segments[i]["end"]  <= turn.end:
-                    try:
-                        new_seg.text_en += f' {segments[i]["text_en"]}'
-                    except:
-                        pass
-
-                    try:
-                        new_seg.text_hi += f' {segments[i]["text_hi"]}'
-                    except:
-                        pass
+                    if stype == 'in':
+                        try:
+                            new_seg.text_in += f' {segments[i]["text_in"]}'
+                        except:
+                            pass
+                    else:
+                        try:
+                            new_seg.text_out += f' {segments[i]["text_out"]}'
+                        except:
+                            pass
                 else:
                     log.info(new_seg)
-                    if len(new_seg.text_en) > 1 or len(new_seg.text_hi) > 1:
+                    if len(new_seg.text_in) > 0 or len(new_seg.text_out) > 0:
                         new_segments.append(new_seg)
                         j+=1
                     break
@@ -563,9 +608,10 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
 
     import whispermlx
     asr_options = {
-        "temperatures" : [0.4],
-        "logprob-threshold" : -0.25,
-        #"condition_on_previous_text": False
+        "temperatures" : [0.1, 0.3],
+        "logprob-threshold" : -0.5,
+        "best_of":2,
+        "condition_on_previous_text": True
     }
     model = whispermlx.load_model(model_size, device=device, asr_options=asr_options)
     result = model.transcribe(str(vocals_16k))
@@ -599,7 +645,7 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
     
     for i, seg in enumerate(result["segments"]):
         text = (seg.get("text") or "").strip()
-        if not text:
+        if not text or len(text)<0:
             continue
         speaker = seg.get("speaker")
         ref_path = ref_dir / f"{speaker}_{i}.wav"
@@ -615,16 +661,13 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
 
         new_seg = Segment(
             index=i, start=float(seg["start"]), end=float(seg["end"]),
-            speaker=speaker or "SPEAKER_00", text_en=text,
-            ref_audio_path = str(ref_path)
+            speaker=speaker or "SPEAKER_00", text_in=text,
+            audio_path = str(ref_path)
         )
-        # Get description
         if not clap_model:
             new_seg.gender = gender_classifier(clip)[0]['label']
-
         # Write audio
         sf.write(str(ref_path), clip, sr)
-        # Finalized segment
         segments.append(new_seg)
 
     cache.write_text(json.dumps([asdict(s) for s in segments], indent=2))
@@ -633,7 +676,8 @@ def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
     return segments
 
 
-def build_clap_profiles(segments, vocals_wav, workdir, clap_model:str, device = 'mps', language='hindi', force=False):
+def build_clap_profiles(segments, vocals_wav, workdir, clap_model:str, device = 'mps', 
+                        tgt_lang='hindi', force=False):
     cache = workdir / "transcript_clap.json"
     if cache.exists() and not force:
         data = json.loads(cache.read_text())
@@ -647,7 +691,7 @@ def build_clap_profiles(segments, vocals_wav, workdir, clap_model:str, device = 
     for new_seg in segments:
         # Get description
             clip_48k = audio_48k[int(new_seg.start * 48000):int(new_seg.end*48000)]
-            new_seg = get_clap_description(new_seg, clip_48k, desc_model, desc_processor, device, language)
+            new_seg = get_clap_description(new_seg, clip_48k, desc_model, desc_processor, device, tgt_lang)
 
     cache.write_text(json.dumps([asdict(s) for s in segments], indent=2))
     return segments
@@ -759,7 +803,7 @@ def extract_pitch_and_speed(segments: List[Segment], vocals_16k: Path) -> List[S
     for seg in segments:
         chunk = audio[int(seg.start * sr):int(seg.end * sr)]
         duration = max(seg.end - seg.start, 0.01)
-        seg.speed_wps = len(seg.text_en.split()) / duration
+        seg.speed_wps = len(seg.text_in.split()) / duration
 
         if len(chunk) < sr * 0.2:
             seg.pitch_hz = 130.0
@@ -780,20 +824,17 @@ def extract_pitch_and_speed(segments: List[Segment], vocals_16k: Path) -> List[S
             seg.gender = "female" if seg.pitch_hz > 175 else "male"
     return segments
 
-
 # --------------------------------------------------------------------------
 # Stage 5: translation
 # --------------------------------------------------------------------------
 
 def translate_indictrans2(segments: List[Segment], workdir: Path, force: bool = False,
-                            device: str = "cpu") -> List[Segment]:
+                        src_lang:str='eng_Latn', tgt_lang:str='hin_Deva',
+                        device: str = "cpu") -> List[Segment]:
     cache = workdir / "translated.json"
     if cache.exists() and not force:
-        cached = {s["index"]: s["text_hi"] for s in json.loads(cache.read_text())}
-        if all(seg.index in cached for seg in segments):
-            for seg in segments:
-                seg.text_hi = cached[seg.index]
-            return segments
+        data = json.loads(cache.read_text())
+        return [Segment(**s) for s in data]
 
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
     from IndicTransToolkit.processor import IndicProcessor
@@ -803,8 +844,7 @@ def translate_indictrans2(segments: List[Segment], workdir: Path, force: bool = 
     model = AutoModelForSeq2SeqLM.from_pretrained(model_name, trust_remote_code=True).to(device)
     ip = IndicProcessor(inference=True)
 
-    src_lang, tgt_lang = "eng_Latn", "hin_Deva"
-    texts = [seg.text_en for seg in segments]
+    texts = [seg.text_in for seg in segments]
     batch_size = 8
     translations: List[str] = []
     for i in range(0, len(texts), batch_size):
@@ -818,59 +858,59 @@ def translate_indictrans2(segments: List[Segment], workdir: Path, force: bool = 
                                            clean_up_tokenization_spaces=True)
         translations.extend(ip.postprocess_batch(decoded, lang=tgt_lang))
 
-    for seg, hi in zip(segments, translations):
-        seg.text_hi = hi
-        log.info("[%d] EN: %s", seg.index, seg.text_en)
-        log.info("[%d] HI: %s", seg.index, seg.text_hi)
+    for seg, out in zip(segments, translations):
+        seg.text_out = out
+        log.info("[%d] IN: %s", seg.index, seg.text_in)
+        log.info("[%d] OUT: %s", seg.index, seg.text_out)
 
-    cache.write_text(json.dumps([{"index": s.index, "text_hi": s.text_hi} for s in segments], indent=2))
+    cache.write_text(json.dumps([asdict(s) for s in segments], indent=2))
     return segments
 
 
 def translate_nllb(segments: List[Segment], workdir: Path, force: bool = False,
-                     device: str = "cpu") -> List[Segment]:
+                    src_lang:str='eng_Latn', tgt_lang:str='hin_Deva',
+                    device: str = "cpu") -> List[Segment]:
     """Fallback translator if IndicTransToolkit isn't installed."""
     cache = workdir / "translated.json"
     if cache.exists() and not force:
-        cached = {s["index"]: s["text_hi"] for s in json.loads(cache.read_text())}
-        if all(seg.index in cached for seg in segments):
-            for seg in segments:
-                seg.text_hi = cached[seg.index]
-            return segments
+        data = json.loads(cache.read_text())
+        return [Segment(**s) for s in data]
 
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     model_name = "facebook/nllb-200-distilled-600M"
-    tok = AutoTokenizer.from_pretrained(model_name, src_lang="eng_Latn")
+    tok = AutoTokenizer.from_pretrained(model_name, src_lang=src_lang)
     model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
-    hi_id = tok.convert_tokens_to_ids("hin_Deva")
+    tgt_id = tok.convert_tokens_to_ids(tgt_lang)
 
     for seg in segments:
-        inputs = tok(seg.text_en, return_tensors="pt").to(device)
-        generated = model.generate(**inputs, forced_bos_token_id=hi_id, max_new_tokens=256)
-        seg.text_hi = tok.batch_decode(generated, skip_special_tokens=True)[0].strip()
+        inputs = tok(seg.text_in, return_tensors="pt").to(device)
+        generated = model.generate(**inputs, forced_bos_token_id=tgt_id, max_new_tokens=256)
+        seg.text_out = tok.batch_decode(generated, skip_special_tokens=True)[0].strip()
 
-    cache.write_text(json.dumps([{"index": s.index, "text_hi": s.text_hi} for s in segments], indent=2))
+    cache.write_text(json.dumps([asdict(s) for s in segments], indent=2))
     return segments
 
 
-def build_texts_for_translate(segments, sym, thresh=30):
+def build_texts_for_translate(segments, sym, thresh=20):
     # Generate the output
+    import re
+    remove = r'[\[\]-_]'
     texts = []
     i = 0
     text = ''
-    gender = segments[0].gender
+    gender = segments[i].gender
 
     def append_text(seg, t, g, i):
         if len(t) > 0:
             texts.append((t, g, i))
-        return f'{seg.text_en} {sym} ', seg.gender, 1
+        return f'{re.sub(remove, '', seg.text_in)} {sym} ', seg.gender, 1
 
     for seg in segments:
         if gender != seg.gender:
             text, gender, i = append_text(seg, text, gender, i)
         else:
-            text += f'{seg.text_en} {sym} '
+            text += f'{re.sub(remove, '', seg.text_in)} {sym} '
             i+=1
         if i%thresh == 0:
             text, gender,i = append_text(seg, text, gender, i)
@@ -881,17 +921,12 @@ def build_texts_for_translate(segments, sym, thresh=30):
     return texts
 
 def translate_mlx(segments: List[Segment], workdir: Path, force: bool = False,
-                     device: str = "cpu", tgt_lang = "Hindi", sym='+',
-                     model_name = "lmstudio-community/gemma-4-E4B-it-MLX-4bit") -> List[Segment]:
+                  src_lang:str='english', tgt_lang:str='hindi', sym=';',
+                  model_name = "lmstudio-community/gemma-4-E4B-it-MLX-4bit") -> List[Segment]:
     cache = workdir / "translated.json"
     if cache.exists() and not force:
-        cached = {s["index"]: (s["text_hi"], s["start"], s["end"]) for s in json.loads(cache.read_text())}
-        if all(seg.index in cached for seg in segments):
-            for seg in segments:
-                seg.text_hi = cached[seg.index][0]
-                seg.start = cached[seg.index][1]
-                seg.end = cached[seg.index][2]
-            return segments
+        data = json.loads(cache.read_text())
+        return [Segment(**s) for s in data]
 
     import re
     from mlx_lm import generate, load
@@ -904,7 +939,7 @@ def translate_mlx(segments: List[Segment], workdir: Path, force: bool = False,
 
     for t,g,i in texts:
         prompt = f"""<bos><start_of_turn>user
-Translate the English text below to {tgt_lang}. Speaker gender {g}. Do not translate, change, or remove {sym}, keep {sym} in the exact same spot in the text. 
+Translate the {src_lang} text below to {tgt_lang}. Speaker gender {g}. Do not translate, change, or remove {sym}, keep {sym} in the exact same spot in the text. 
 
 {t}<end_of_turn>"""
         output_text = generate(model, tokenizer, prompt=prompt, max_tokens = min(4*len(t),200))
@@ -913,25 +948,21 @@ Translate the English text below to {tgt_lang}. Speaker gender {g}. Do not trans
         out.extend(temp[:thresh])
 
     for i, t in enumerate(out[:len(segments)]):
-        segments[i].text_hi = t
+        segments[i].text_out = t
+        if len(t)<1:
+            segments[i].tts_audio_path = segments[i].audio_path
 
-    cache.write_text(json.dumps([{"index": s.index, "text_hi": s.text_hi, 
-                              "start":s.start, "end":s.end} for s in segments], indent=2))
+    cache.write_text(json.dumps([asdict(s) for s in segments], indent=2))
     return segments
 
 def translate_sarvam(segments: List[Segment], workdir: Path, force: bool = False,
-                     device: str = "cpu", tgt_lang = "Hindi", sym='+',
+                     device: str = "cpu", src_lang = 'English', tgt_lang = "Hindi", sym=';',
                      model_name = "sarvamai/sarvam-translate") -> List[Segment]:
     """Fallback translator if IndicTransToolkit isn't installed."""
     cache = workdir / "translated.json"
     if cache.exists() and not force:
-        cached = {s["index"]: (s["text_hi"], s["start"], s["end"]) for s in json.loads(cache.read_text())}
-        if all(seg.index in cached for seg in segments):
-            for seg in segments:
-                seg.text_hi = cached[seg.index][0]
-                seg.start = cached[seg.index][1]
-                seg.end = cached[seg.index][2]
-            return segments
+        data = json.loads(cache.read_text())
+        return [Segment(**s) for s in data]
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
     import re
@@ -942,14 +973,11 @@ def translate_sarvam(segments: List[Segment], workdir: Path, force: bool = False
 
     thresh = 30
     texts = build_texts_for_translate(segments, sym, thresh)
-    out = []
-
-    #if i!= 0:
-    #    texts.append((text, gender, i))
-
+    offset = 0
     for t,g,i in texts:
         messages = [
-            {"role": "system", "content": f"Translate the text to {tgt_lang}. {g} speaker. Do not translate, change, or remove {sym}, keep {sym} in the exact same spot in the text"},
+            {"role": "system", "content": f"Translate the {src_lang} text to {tgt_lang}. {g} speaker."
+             f"Do not translate, change, or remove {sym}, keep {sym} in the exact same spot in the text"},
             {"role": "user", "content": t}
         ]
         text = tokenizer.apply_chat_template(
@@ -959,28 +987,34 @@ def translate_sarvam(segments: List[Segment], workdir: Path, force: bool = False
         )
         model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
         temp = []
-        while (i != len(temp)):
-            generated_ids = model.generate(
-                **model_inputs,
-                max_new_tokens=1024,
-                do_sample=True,
-                temperature=0.01,
-                top_p = 0.5,
-                top_k = 20,
-                num_return_sequences=1
-            )
-            output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
-            output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
-            output_text = re.sub(r'<[^>]*>', '', output_text) # remove model output tags
-            log.info(f"{t}, {output_text}")
-            temp = output_text.strip().strip(sym).split(sym)
-        out.extend(temp[:min(i+1,thresh)])
-   
-    for i, t in enumerate(out[:len(segments)]):
-        segments[i].text_hi = t
+        #while (i > len(temp)):
+        generated_ids = model.generate(
+            **model_inputs,
+            max_new_tokens=1024,
+            do_sample=True,
+            temperature=0.01,
+            top_p = 0.5,
+            top_k = 20,
+            num_return_sequences=1
+        )
+        output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
+        output_text = tokenizer.decode(output_ids, skip_special_tokens=True)
+        output_text = re.sub(r'<[^>]*>', '', output_text)
+        log.info(f"{t}, {output_text}")
+        temp = output_text.strip().strip(sym).split(sym)
+        
+        # Adds translated text - TODO : sometimes missing a few in the middle 
+        for j, ot in enumerate(temp):
+            k = offset + j
+            if len(segments) > k:
+                log.info(f"{j} -> {k} - {segments[k].text_in} : {ot}")
+                segments[k].text_out = ot
+        offset+=i
+    # for i, ot in enumerate(out[:len(segments)]):
+    #     log.info(f"{i} : {ot}")
+    #     segments[i].text_out = ot
 
-    cache.write_text(json.dumps([{"index": s.index, "text_hi": s.text_hi, 
-                              "start":s.start, "end":s.end} for s in segments], indent=2))
+    cache.write_text(json.dumps([asdict(s) for s in segments], indent=2))
     return segments
 
 
@@ -993,12 +1027,11 @@ def translate_sarvam(segments: List[Segment], workdir: Path, force: bool = False
 # the same detected gender, they will share a base timbre under Method A --
 # differentiate them further via speaker_overrides.json (see below) or use
 # Method B (voice cloning) instead.
-HINDI_PARLER_PRESETS = {
+target_PARLER_PRESETS = {
     "male": ["Rohit", "Aman"],          # Rohit is AI4Bharat's recommended male preset
     "female": ["Divya", "Rani"],        # Divya is AI4Bharat's recommended female preset
     "child": ['Aman',"Divya"],          # no dedicated child voice for Hindi; closest available
 }
-
 
 def build_parler_description(seg: Segment) -> str:
     """Composes a natural-language caption per Indic Parler-TTS's documented
@@ -1017,35 +1050,82 @@ def build_parler_description(seg: Segment) -> str:
     }.get(emotion, "conversational")
 
     return (
-        f"{HINDI_PARLER_PRESETS[seg.gender][0]}'s voice is {pitch_adj} and {rate_adj}, delivered in a "
+        f"{target_PARLER_PRESETS[seg.gender][0]}'s voice is {pitch_adj} and {rate_adj}, delivered in a "
         f"{emotion_adj} tone. The recording is very clear and close-sounding, with no "
         f"background noise."
     )
 
+def get_mfcc(audio_file):
+    y, sr = librosa.load(audio_file)
+
+    # Extract MFCC features
+    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
+    mfccs = np.mean(mfccs.T, axis=0)
+    return mfccs
+
+def find_closest(sorted_tuples, target, idx = 0):
+    return min(sorted_tuples, key=lambda x: abs(x[idx] - target))
+
+def get_closest_long_clip(segments:List[Segment], speech_time = 3.0):
+    from heapq import heappush
+    speakers = defaultdict(list)
+    for i, seg in enumerate(segments):
+        log.info(f"{seg.gender} {seg.pitch_hz} {seg.text_out}")
+        if seg.end - seg.start > speech_time:
+            heappush(speakers[seg.gender], (seg.pitch_hz, i))
+        if not seg.ref_audio_path:
+            seg.ref_audio_path = seg.audio_path
+
+    for seg in segments:
+        try:
+            if (seg.end - seg.start < speech_time):
+                _, i = find_closest(speakers[seg.gender], seg.pitch_hz)
+            seg.ref_audio_path = segments[i].ref_audio_path
+        except:
+            if not seg.ref_audio_path:
+                seg.ref_audio_path = seg.audio_path
+            
+    return segments, speakers
+
 
 # Voice clone profiles
-def build_speaker_ref_profiles(segments: List[Segment], workdir: Path,
-                             override_path: Optional[Path] = None) -> Dict[str, SpeakerProfile]:
-    import librosa
-    profiles: Dict[str, List[str]] = defaultdict(list)
+def build_speaker_ref_profiles(segments: List[Segment], workdir: Path, 
+                thresh = 4.0, max_audios =6, max_thresh = 8.0):
+    from heapq import heappush, heappop
+    speakers = defaultdict(list)
     for seg in segments:
-        if librosa.get_duration(path = seg.ref_audio_path) > 5.0:
-            profiles[seg.speaker].append(str(seg.ref_audio_path))
+        dur = seg.end - seg.start
+        if thresh < dur and max_thresh>dur:
+            heappush(speakers[seg.speaker], (dur, seg.pitch_hz, seg.ref_audio_path))
+            if len(speakers[seg.speaker]) >max_audios:
+                heappop(speakers[seg.speaker])
+
+    for seg in segments:
+        if seg.end - seg.start > thresh:
+            seg.ref_audio_path = seg.audio_path
+        elif len(speakers[seg.speaker]) > 0:
+            seg.ref_audio_path = find_closest(speakers[seg.speaker], seg.pitch_hz, idx=1)[-1]
+        else:
+            # don't generate this person whose voice is not available at all
+            seg.tts_audio_path = seg.audio_path
 
     (workdir / "speaker_profiles.json").write_text(
-        json.dumps({k: v for k, v in profiles.items()}, indent=2, ensure_ascii=False)
+        json.dumps({k: v for k, v in speakers.items()}, indent=2, ensure_ascii=False)
     )
-    return profiles
+    return segments, speakers
 
+def check_dont_generate(seg, time = 1.0, chars = 2):
+    return (seg.end - seg.start < time or not seg.text_out  or len(seg.text_out) < chars) or \
+            (seg.tts_audio_path and Path(seg.tts_audio_path).exists())
 # --------------------------------------------------------------------------
 # Stage 7a: TTS Method A -- Indic Parler-TTS
+# Mostly use for creating styled audio since it is good at copying voice accent,
+# but really bad at actually generating TTS
 # --------------------------------------------------------------------------
-
 def synth_parler(segments: List[Segment], workdir: Path, force: bool = False, 
                  model_name = "ai4bharat/indic-parler-tts", device: str = "cpu") -> List[Segment]:
     from parler_tts import ParlerTTSForConditionalGeneration
     from transformers import AutoTokenizer
-    import json
 
     out_dir = ensure_dir(workdir / "tts_parler")
     model = ParlerTTSForConditionalGeneration.from_pretrained(
@@ -1057,24 +1137,31 @@ def synth_parler(segments: List[Segment], workdir: Path, force: bool = False,
     for seg in segments:
         out_path = out_dir / f"seg_{seg.index:04d}.wav"
         if out_path.exists() and not force:
-            seg.tts_audio_path = str(out_path)
+            seg.ref_audio_path = str(out_path)
+            continue
+
+        if check_dont_generate(seg):
+            seg.ref_audio_path = seg.audio_path
             continue
 
         if not seg.description:
             seg.description = build_parler_description(seg)
 
         desc_ids = description_tokenizer(seg.description, return_tensors="pt").to(device)
-        prompt_ids = tokenizer(seg.text_hi, return_tensors="pt").to(device)
+        prompt_ids = tokenizer(seg.text_out, return_tensors="pt").to(device)
         with torch.no_grad():
             generation = model.generate(
                 input_ids=desc_ids.input_ids, attention_mask=desc_ids.attention_mask,
                 prompt_input_ids=prompt_ids.input_ids, prompt_attention_mask=prompt_ids.attention_mask,
             )
         audio_arr = generation.cpu().numpy().squeeze()
+        if audio_arr.ndim == 1:
+            audio_arr = audio_arr[:, np.newaxis]
+        else:
+            print(audio_arr.shape)
         sf.write(str(out_path), audio_arr, model.config.sampling_rate)
-        seg.tts_audio_path = str(out_path)
+        seg.ref_audio_path = str(out_path)
         log.info("[%d] Parler synth : %s", seg.index, seg.description)
-
     return segments
 
 # --------------------------------------------------------------------------
@@ -1090,8 +1177,6 @@ def build_clone_references(segments: List[Segment], vocals_16k: Path, workdir: P
     English-specific articulation for the model to imitate."""
     ref_dir = ensure_dir(workdir / "clone_refs")
     audio, sr = sf.read(str(vocals_16k))
-
-    profiles = {}
 
     for seg in segments:
         out_path = ref_dir / f"seg_{seg.index:04d}_ref.wav"
@@ -1113,41 +1198,49 @@ def build_clone_references(segments: List[Segment], vocals_16k: Path, workdir: P
     return segments
 
 
-def synth_clone_indicf5(segments: List[Segment], workdir: Path, force: bool = False) -> List[Segment]:
+# Use only with indic-parler-tts to fix accent issues
+def synth_clone_f5(segments: List[Segment], workdir: Path,
+                    model_name:str = "ai4bharat/IndicF5", source = 'ref',
+                    force: bool = False) -> List[Segment]:
     from transformers import AutoModel
     out_dir = ensure_dir(workdir / "tts_clone")
-    model = AutoModel.from_pretrained("ai4bharat/IndicF5", trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_name)#, trust_remote_code=True)
 
     for seg in segments:
         out_path = out_dir / f"seg_{seg.index:04d}.wav"
         if out_path.exists() and not force:
             seg.tts_audio_path = str(out_path)
             continue
-        if not seg.ref_audio_path or not seg.text_hi:
+        if not seg.audio_path or not seg.text_out:
             log.warning("Segment %d missing reference audio or translation; skipping", seg.index)
             continue
 
-        audio = model(
-            seg.text_hi,
-            ref_audio_path=seg.ref_audio_path,
-            ref_text=seg.text_en,   # transcript of the reference clip, per IndicF5's documented API
-        )
-        if audio.dtype == np.int16:
-            audio = audio.astype(np.float32) / 32768.0
-        sf.write(str(out_path), np.array(audio, dtype=np.float32), samplerate=24000)
-        seg.tts_audio_path = str(out_path)
-        log.info("[%d] IndicF5 clone synth (ref=%s)", seg.index, Path(seg.ref_audio_path).name)
-
+        if check_dont_generate(seg):
+            if not seg.tts_audio_path:
+                seg.tts_audio_path = seg.audio_path
+        else:
+            if source == 'ref':
+                ref = seg.ref_audio_path
+            else:
+                ref = seg.audio_path
+            audio = model(
+                seg.text_out,
+                audio_path=ref,
+                ref_text=seg.text_in,   # transcript of the reference clip, per IndicF5's documented API
+            )
+            if audio.dtype == np.int16:
+                audio = audio.astype(np.float32) / 32768.0
+            sf.write(str(out_path), np.array(audio, dtype=np.float32), samplerate=24000)
+            seg.tts_audio_path = str(out_path)
+        log.info("[%d] IndicF5 clone synth (ref=%s)", seg.index, Path(seg.audio_path).name)
     return segments
 
 
 # --------------------------------------------------------------------------
-# Stage 7b: TTS Method B -- XTTS voice cloning (few shot)
+# Stage 7c: TTS Method c -- XTTS voice cloning (few shot)
 # --------------------------------------------------------------------------
-def synth_coqui(segments: List[Segment], profiles: Dict[str, List[str]],
-                workdir: Path, gpt_cond_len = 30,
-                force: bool = False, device: str = "cpu") -> List[Segment]:
-    import shutil
+def synth_coqui(segments: List[Segment], workdir: Path, profiles: Dict[str, List[str]]={}, 
+                tgt_lang = 'hi', gpt_cond_len = 30, force: bool = False ) -> List[Segment]:
     from TTS.api import TTS
     tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2")
     tts_dir = ensure_dir(workdir / "tts_raw")
@@ -1156,25 +1249,119 @@ def synth_coqui(segments: List[Segment], profiles: Dict[str, List[str]],
         if out_path.exists() and not force:
             seg.tts_audio_path = str(out_path)
             continue
-        if not seg.ref_audio_path:
+        if not seg.audio_path:
             log.warning("No reference audio for segment %s, skipping", seg.index)
             continue
-        if len(seg.text_en) < 12:# or len(profiles[seg.speaker]) == 0:
-            shutil.copy(seg.ref_audio_path, out_path)
+        if check_dont_generate(seg, 0.3, 1):
+            if not seg.tts_audio_path:
+                seg.tts_audio_path = seg.audio_path
         else:
-            if profiles[seg.speaker] and len(profiles[seg.speaker]) > 0:
-                refs = [seg.ref_audio_path] + list(np.random.choice(profiles[seg.speaker], size=3, replace=True))
+            if seg.ref_audio_path:
+                refs = [seg.audio_path, seg.ref_audio_path]
             else:
-                refs = seg.ref_audio_path
-            try:
-                tts.tts_to_file(text=seg.text_hi,
-                        file_path=out_path,
-                        speaker_wav=refs,
-                        language="hi",
-                        gpt_cond_len = gpt_cond_len)
-            except:
-                shutil.copy(seg.ref_audio_path, out_path)
+                refs = seg.audio_path
+                try:
+                    tts.tts_to_file(text=seg.text_out,
+                            file_path=out_path,
+                            speaker_wav=refs,
+                            language=tgt_lang,
+                            gpt_cond_len = gpt_cond_len)
+                    seg.tts_audio_path = str(out_path)
+                except:
+                    seg.tts_audio_path = seg.audio_path
+    return segments
+
+# --------------------------------------------------------------------------
+# Stage 7e: TTS Method D -- Chatterbox Multilingual + voice cloning
+# --------------------------------------------------------------------------
+def synth_chatterbox(segments:List[Segment], workdir:Path,
+            tgt_lang = 'hi', force: bool = False,  device: str = "cpu" ) -> List[Segment]:
+    # 24000 hz
+    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+    import torchaudio
+
+    out_dir = ensure_dir(workdir / "tts")
+    multilingual_model = ChatterboxMultilingualTTS.from_pretrained(device=device, t3_model="v3")
+    
+    for seg in segments:
+        out_path = out_dir / f"seg_{seg.index:04d}_temp.wav"
+        if out_path.exists() and not force:
+            seg.tts_audio_path = str(out_path)
+            continue
+
+        if check_dont_generate(seg, 0.7, 2):
+            if not seg.tts_audio_path:
+                seg.tts_audio_path = seg.audio_path
+            continue
+
         seg.tts_audio_path = str(out_path)
+        arr = multilingual_model.generate(seg.text_out, language_id=tgt_lang)
+        torchaudio.save(seg.tts_audio_path, arr, multilingual_model.sr)
+    return segments
+
+
+def voice_style_transfer_chatterbox(segments: List[Segment], workdir: Path,
+                tgt_lang:str = 'hi', force: bool = False, device: str = "cpu") -> List[Segment]:
+    # 24000 hz
+    synth_chatterbox(segments, workdir,tgt_lang, force, device )
+    from chatterbox.vc import ChatterboxVC
+    import torchaudio
+    out_dir = ensure_dir(workdir / "voice_styled")
+    voice_model = ChatterboxVC.from_pretrained(
+        device=device,
+    )
+
+    for seg in segments:
+        out_path = out_dir / f"seg_{seg.index:04d}.wav"
+        if out_path.exists() and not force:
+            seg.tts_audio_path = str(out_path)
+            continue
+
+        if check_dont_generate(seg, 0.7, 2):
+            if not seg.tts_audio_path:
+                seg.tts_audio_path = seg.audio_path
+            continue
+
+        # Using english audio to voice clone if no references
+        if not seg.ref_audio_path:
+            continue
+        print(seg.text_in, seg.text_out, seg.tts_audio_path)
+        arr = voice_model.generate(
+            seg.tts_audio_path,
+            seg.ref_audio_path
+        )
+        
+        log.info(f"{voice_model.sr} {arr.shape}")
+        torchaudio.save(str(out_path), arr, voice_model.sr)
+        # Note variable reset to styled wav
+        seg.tts_audio_path = str(out_path)
+        
+    return segments
+
+# --------------------------------------------------------------------------
+# Stage 7e: TTS Method D -- Voxtral (Zero shot)
+# --------------------------------------------------------------------------
+
+def synth_voxtral(segments: List[Segment], workdir: Path, lang = 'hi', force = False) -> List[Segment]:
+    from mlx_audio.tts.utils import load
+    model = load("mlx-community/Voxtral-4B-TTS-2603-mlx-bf16")
+    tts_dir = ensure_dir(workdir / "tts_voxtral")
+    for seg in segments:
+        out_path = tts_dir / f"seg_{seg.index:04d}.wav"
+        if out_path.exists() and not force:
+            seg.tts_audio_path = str(out_path)
+            continue
+        if not seg.audio_path:
+            log.warning("No reference audio for segment %s, skipping", seg.index)
+            continue
+        if len(seg.text_in) < 12 or seg.end - seg.start < 0.3:
+            seg.tts_audio_path = seg.audio_path
+        else:
+            try:
+                model.generate(text=seg.text_out, voice=f"{lang}_{seg.gender}")
+                seg.tts_audio_path = str(out_path)
+            except:
+                seg.tts_audio_path = seg.audio_path
     return segments
 
 # --------------------------------------------------------------------------
@@ -1185,8 +1372,8 @@ def get_duration(wav_path: Path) -> float:
     info = sf.info(str(wav_path))
     return info.frames / info.samplerate
 
-def time_stretch(in_path: Path, out_path: Path, factor: float):
-    factor = max(0.5, factor)
+def time_stretch(in_path: Path, out_path: Path, factor: float, min_stretch:float=0.7):
+    factor = max(min_stretch, factor)
     run(["ffmpeg", "-y", "-i", str(in_path), "-filter:a", f"atempo={factor:.4f}", str(out_path)])
 
 
@@ -1194,8 +1381,10 @@ def align_segments(segments: List[Segment], workdir: Path, force: bool = False,
                     max_stretch: float = 1.5) -> List[Segment]:
     aligned_dir = ensure_dir(workdir / "aligned")
     for seg in segments:
-        if not seg.tts_audio_path or len(seg.text_hi) < 1:
-            continue
+        log.info(f"Creating {seg.index} : {seg.tts_audio_path}, {seg.aligned_audio_path}")
+        if not seg.tts_audio_path:
+            seg.tts_audio_path = seg.audio_path
+
         out_path = aligned_dir / f"seg_{seg.index:04d}.wav"
         if out_path.exists() and not force:
             seg.aligned_audio_path = str(out_path)
@@ -1206,10 +1395,10 @@ def align_segments(segments: List[Segment], workdir: Path, force: bool = False,
         factor = actual_dur / target_dur
         factor = max(1.0 / max_stretch, min(factor, max_stretch))
         if abs(factor - 1.0) < 0.03:
-            shutil.copy(seg.tts_audio_path, out_path)
+            seg.aligned_audio_path = seg.tts_audio_path
         else:
             time_stretch(Path(seg.tts_audio_path), out_path, factor)
-        seg.aligned_audio_path = str(out_path)
+            seg.aligned_audio_path = str(out_path)
     return segments
 
 
@@ -1240,9 +1429,9 @@ def normalize_peak(in_array, ceiling=0.999):
     applied_gain = ceiling / peak
     return out * applied_gain, applied_gain
 
-def build_hindi_vocal_track(segments: List[Segment], vocals:Path, total_duration: float, workdir: Path,
+def build_target_vocal_track(segments: List[Segment], vocals:Path, total_duration: float, workdir: Path,
                               sample_rate: int = 48000, fade_ms: float = 10.0) -> Path:
-    out_path = workdir / "hindi_vocals_full.wav"
+    out_path = workdir / "target_vocals_full.wav"
     canvas = np.zeros((int(total_duration * sample_rate) + sample_rate, 2), dtype=np.float64)
     fade_samples = int(sample_rate * fade_ms / 1000.0)
 
@@ -1363,20 +1552,20 @@ def match_envelope(src, ref, sr_src, sr_ref, window_ms=50.0, hop_ms=10.0,
         out = out * (0.999 / peak)
     return out
 
-def normalize_new_vocals(hindi_vocals_wav: Path, vocals_wav: Path, workdir: Path, 
+def normalize_new_vocals(target_vocals_wav: Path, vocals_wav: Path, workdir: Path, 
                         demucs = "demucs", demucs_model="htdemucs", device="cpu", sample_rate: int = 48000) -> Path:
     # Denoise
-    out_dir = workdir / "hindi_demucs_out"
+    out_dir = workdir / "target_demucs_out"
     ensure_dir(out_dir)
-    run([demucs, "-n", demucs_model, "--two-stems=vocals", "-o", str(out_dir), str(hindi_vocals_wav)])
+    run([demucs, "-n", demucs_model, "--two-stems=vocals", "-o", str(out_dir), str(target_vocals_wav)])
 
     # Adjust volume to match original vocals by windowing and scaling
-    new_vocals_wav = out_dir / "htdemucs" / "hindi_vocals_full" / "vocals.wav"
+    new_vocals_wav = out_dir / "htdemucs" / "target_vocals_full" / "vocals.wav"
     src = load_in_stereo(str(new_vocals_wav), sample_rate)
     ref = load_in_stereo(vocals_wav, sample_rate)
     out = match_envelope(src, ref, sample_rate, sample_rate)
 
-    normalized_wav = workdir / "hindi_vocals_normalized.wav"
+    normalized_wav = workdir / "target_vocals_normalized.wav"
     sf.write(str(normalized_wav), out, sample_rate)
 
     return normalized_wav
@@ -1408,7 +1597,7 @@ def adjust_array(arr, max_len):
         return arr[:max_len, :]
     return arr
 
-def scale_vocal_background(vocals_wav, background_wav, stereo_wav, hindi_vocals, workdir, duration, sr=48000):
+def scale_vocal_background(vocals_wav, background_wav, stereo_wav, target_vocals, workdir, duration, sr=48000):
     # May need to stack audios
     arr1 = load_in_stereo(vocals_wav, sr)
     arr2  = load_in_stereo(background_wav, sr)
@@ -1419,7 +1608,7 @@ def scale_vocal_background(vocals_wav, background_wav, stereo_wav, hindi_vocals,
 
     log.info(f"{x},{y}")
 
-    new_arr1 = load_in_stereo(hindi_vocals, sr)
+    new_arr1 = load_in_stereo(target_vocals, sr)
     max_len = int(duration*sr)
 
     log.info(f"{new_arr1.shape}, {arr2.shape}, {duration}")
@@ -1428,15 +1617,15 @@ def scale_vocal_background(vocals_wav, background_wav, stereo_wav, hindi_vocals,
 
     final, gain = normalize_peak(new_arr1+arr2)
     log.info(f"{final.shape}, {gain}")
-    output_path = workdir / "hindi_final_track.wav"
+    output_path = workdir / "target_final_track.wav"
     sf.write(output_path, final, sr)
     return output_path
 
-def loudness_match_and_mix(hindi_vocals: Path, background: Path, workdir: Path) -> Path:
-    # normalized = workdir / "hindi_vocals_final.wav"
-    # run(["ffmpeg", "-y", "-i", str(hindi_vocals), "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11", str(normalized)])
-    mixed = workdir / "hindi_final_track.wav"
-    run(["ffmpeg", "-y", "-i", str(hindi_vocals), "-i", str(background),
+def loudness_match_and_mix(target_vocals: Path, background: Path, workdir: Path) -> Path:
+    # normalized = workdir / "target_vocals_final.wav"
+    # run(["ffmpeg", "-y", "-i", str(target_vocals), "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11", str(normalized)])
+    mixed = workdir / "target_final_track.wav"
+    run(["ffmpeg", "-y", "-i", str(target_vocals), "-i", str(background),
          "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0", str(mixed)])
     return mixed
 
@@ -1445,8 +1634,8 @@ def loudness_match_and_mix(hindi_vocals: Path, background: Path, workdir: Path) 
 # Stage 10: mux into video
 # --------------------------------------------------------------------------
 
-def mux_into_video(video_path: Path, hindi_track: Path, output_path: Path):
-    run(["ffmpeg", "-y", "-i", str(video_path), "-i", str(hindi_track),
+def mux_into_video(video_path: Path, target_track: Path, output_path: Path):
+    run(["ffmpeg", "-y", "-i", str(video_path), "-i", str(target_track),
          "-map", "0:v", "-map", "0:a", "-map", "1:a",
          "-c:v", "copy", "-c:a:0", "copy", "-c:a:1", "aac", "-b:a:1", "192k",
          "-metadata:s:a:0", "language=eng",
@@ -1503,12 +1692,12 @@ def main():
 
     ap.add_argument("--translator", default="indictrans2", choices=["indictrans2", "nllb", "mlx", "sarvam"])
 
-    ap.add_argument("--tts-method", required=True, choices=["parler", "clone", 'coqui'])
+    ap.add_argument("--tts-method", required=True, choices=["parler", "voxtral", 'coqui', 'chatterbox'])
     ap.add_argument("--clap-model", action='store_true')
     ap.add_argument("--speaker-overrides", type=Path, default=None,
                      help="JSON: {\"SPEAKER_00\": {\"parler_preset\": \"Rohit\"}} to manually pin presets")
-    ap.add_argument("--f5-ref-max-seconds", type=float, default=6.0)
-    ap.add_argument("--max-stretch", type=float, default=2.0)
+    ap.add_argument("--ref-max-seconds", type=float, default=20.0)
+    ap.add_argument("--max-stretch", type=float, default=1.3)
     ap.add_argument("--slowdown", type=float, default=1.0)
 
     ap.add_argument("--force", action="store_true")
@@ -1527,15 +1716,15 @@ def main():
     need_translate = True
     lang = args.target_lang
     if args.subtitle_file:
-        segments = read_subs_as_whisper_segments(sub, lang = lang)
+        segments = read_subs_as_whisper_segments(sub, stype = 'out')
     if sub is None and not args.no_use_subs:
-        sub_file = extract_embedded_subtitles(args.input, workdir / f"{lang}_subs.srt", lang=lang)
+        sub_file = extract_embedded_subtitles(args.input, workdir / f"subs.srt", lang=lang)
         if sub_file is None:
             lang = args.source_lang
-            sub_file = extract_embedded_subtitles(args.input, workdir / f"{lang}_subs.srt", lang=lang)
+            sub_file = extract_embedded_subtitles(args.input, workdir / f"subs.srt", lang=lang)
         else:
             need_translate = False
-        segments = read_subs_as_whisper_segments(sub_file, lang)
+        segments = read_subs_as_whisper_segments(sub_file, stype='in')
 
     # Separate audio
     stereo_wav, _mono_unused = extract_audio(args.input, workdir, force=args.force)
@@ -1550,11 +1739,14 @@ def main():
 
     # Subtitle created segments
     if segments:
-        segments = subs_and_diarize(
-            vocals_16k, vocals_wav, workdir, segments, force=args.force, model_size=args.whisper_model,
-            device=device, diarize=not args.no_diarize, hf_token=args.hf_token,
-            clap_model=clap_model
-        )
+        if args.no_diarize:
+            segments = subs_only_transcription(vocals_16k, workdir, segments, force=args.force)
+        else:
+            segments = subs_and_diarize(
+                vocals_16k, workdir, segments, force=args.force,
+                device=device, hf_token=args.hf_token,
+                clap_model=clap_model
+            )
 
     if not segments:
         # Subtitle pipeline failed, transcribe instead
@@ -1568,27 +1760,44 @@ def main():
         log.error("No speech detected -- aborting.")
         sys.exit(1)
 
+    #need_translate = True
     if need_translate:
         if args.translator == "indictrans2":
             try:
-                segments = translate_indictrans2(segments, workdir, force=args.force, device=device)
+                segments = translate_indictrans2(segments, workdir, force=args.force, device=device, 
+                                src_lang=lang_ref[args.source_lang][1], tgt_lang=lang_ref[args.target_lang][1])
             except ImportError as e:
                 log.warning("IndicTransToolkit unavailable (%s); falling back to NLLB", e)
-                segments = translate_nllb(segments, workdir, force=args.force, device=device)
+                segments = translate_nllb(segments, workdir, force=args.force, device=device,
+                                src_lang=lang_ref[args.source_lang][1], tgt_lang=lang_ref[args.target_lang][1])
         elif args.translator == "nllb":
-            segments = translate_nllb(segments, workdir, force=args.force, device=device)
+            segments = translate_nllb(segments, workdir, force=args.force, device=device,
+                                src_lang=lang_ref[args.source_lang][1], tgt_lang=lang_ref[args.target_lang][1])
         elif args.translator == "mlx":
-            segments = translate_mlx(segments, workdir, force=args.force, device=device, model_name="mlx-community/sarvam-translate-mlx-4bit")
+            segments = translate_mlx(segments, workdir, force=args.force, device=device, model_name="mlx-community/sarvam-translate-mlx-4bit",
+                                src_lang=lang_ref[args.source_lang][-1], tgt_lang=lang_ref[args.target_lang][-1])
         else:
-            segments = translate_sarvam(segments, workdir, force=args.force, device=device)
+            segments = translate_sarvam(segments, workdir, force=args.force, device=device,
+                                src_lang=lang_ref[args.source_lang][-1], tgt_lang=lang_ref[args.target_lang][-1])
 
-        for seg in segments:
-            print(seg.text_en, seg.text_hi)
+        for seg in segments[-10:]:
+            print(seg.text_in, seg.text_out)
 
-    segments = extract_pitch_and_speed(segments, vocals_16k) 
+    segments = extract_pitch_and_speed(segments, vocals_16k)
+    # Free mlx memory
+    if device == 'mps':
+        import gc
+        gc.collect()
+
+    # Need to limit the size of sample audio
+    if args.no_diarize:
+        segments, profiles = get_closest_long_clip(segments)
+    else:
+        segments, profiles = build_speaker_ref_profiles(segments, workdir)
     if args.tts_method == "parler":
         if clap_model:
-            segments = build_clap_profiles(segments, vocals_wav, workdir, clap_model, device, lang_ref[lang][-1], args.force)
+            segments = build_clap_profiles(segments, vocals_wav, workdir, clap_model, device, 
+                                lang_ref[lang][-1], args.force)
         elif not args.no_detect_emotion:
             segments = classify_emotion(segments, vocals_16k, workdir, force=args.force,
                                           device=device, backend=args.emotion_backend)
@@ -1597,27 +1806,29 @@ def main():
                     seg.emotion = "neutral"
 
         segments = synth_parler(segments, workdir, force=args.force, device=device)
+        segments = voice_style_transfer_chatterbox(segments, workdir, tgt_lang=args.target_lang, force=args.force, device=args.device)
     else:
-        # Collect coice samples
-        profiles = build_speaker_ref_profiles(segments, workdir, override_path=args.speaker_overrides)
-
-        if args.tts_method == "clone":
-            segments = build_clone_references(segments, vocals_16k, workdir,
-                                                ref_max_seconds=args.f5_ref_max_seconds)
-            segments = synth_clone_indicf5(segments, workdir, force=args.force)
-        elif args.tts_method == "coqui":
+        # Cluster speaker clips, get number of speakers
+        if args.tts_method == "coqui":
             segments = synth_coqui(segments, profiles, workdir, force=args.force, device=device)
+        elif args.tts_method == "voxtral":
+            # Voxtral + indicf5 clone
+            segments = synth_voxtral(segments, workdir, lang=args.target_lang)
+            segments = voice_style_transfer_chatterbox(segments, workdir, tgt_lang=args.target_lang, force=args.force, device=args.device)
+        else:
+            segments = voice_style_transfer_chatterbox(segments, workdir, tgt_lang=args.target_lang,  force=args.force, device=args.device)
+
 
     segments = align_segments(segments, workdir, force=args.force, max_stretch=args.max_stretch)
 
     total_duration = get_media_duration(args.input)
-    hindi_vocals_full = build_hindi_vocal_track(segments, vocals_wav, total_duration, workdir)
-    hindi_vocals_normalized = normalize_new_vocals(hindi_vocals_full, vocals_wav, workdir)
-    # hindi_final_track = scale_vocal_background(vocals_wav, background_wav, stereo_wav, hindi_vocals_normalized, workdir, 
+    target_vocals_full = build_target_vocal_track(segments, vocals_wav, total_duration, workdir)
+    target_vocals_normalized = normalize_new_vocals(target_vocals_full, vocals_wav, workdir)
+    # target_final_track = scale_vocal_background(vocals_wav, background_wav, stereo_wav, target_vocals_normalized, workdir, 
     #                                            total_duration, sr=48000)
-    hindi_final_track = loudness_match_and_mix(hindi_vocals_normalized, background_wav, workdir)
+    target_final_track = loudness_match_and_mix(target_vocals_normalized, background_wav, workdir)
 
-    mux_into_video(args.input, hindi_final_track, args.output)
+    mux_into_video(args.input, target_final_track, args.output)
     log.info("Done. Output: %s", args.output.resolve())
 
 if __name__ == "__main__":
