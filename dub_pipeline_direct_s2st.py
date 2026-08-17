@@ -100,69 +100,14 @@ import numpy as np
 import torch
 from collections import Counter, defaultdict
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+from utils import (
+    Segment,  
+    log, run, ensure_dir, resolve_device,
+    get_speaker_mapping, separate_vocals,
+    transcribe_and_diarize, get_media_duration,
+    align_segments, build_target_vocal_track, 
+    normalize_new_vocals, mux_into_video
 )
-log = logging.getLogger("dub_pipeline_direct_s2st")
-
-# --------------------------------------------------------------------------
-# Data model
-# --------------------------------------------------------------------------
-
-@dataclass
-class Segment:
-    """One VAD-detected speech region. No text is ever stored here --
-    only audio file paths and timing."""
-    index: int
-    start: float
-    end: float
-    speaker: str = "SPEAKER_default"
-    text_en: Optional[str] = ""
-    gender: Optional[str] = None
-    pitch_hz: Optional[float] = None
-    speed_wps: Optional[float] = None 
-
-    ref_audio_path: Optional[str] = None       # clip of original speaker, for voice style transfer
-    s2st_audio_path: Optional[str] = None       # raw SeamlessM4T-v2 Hindi output (generic voice)
-    styled_audio_path: Optional[str] = None     # after voice style transfer
-    aligned_audio_path: Optional[str] = None    # after time-stretch to fit start/end
-
-
-def run(cmd: List[str], **kwargs):
-    log.info("$ %s", " ".join(str(c) for c in cmd))
-    subprocess.run(cmd, check=True, **kwargs)
-
-
-def ensure_dir(p: Path) -> Path:
-    p.mkdir(parents=True, exist_ok=True)
-    return p
-
-def resolve_device(requested: str) -> str:
-    if requested == "cuda" and not torch.cuda.is_available():
-        log.warning("CUDA requested but not available, falling back to CPU")
-        return "cpu"
-    if requested == "mps" and not torch.backends.mps.is_available():
-        log.warning("MPS requested but not available, falling back to CPU")
-        return "cpu"
-    return requested
-
-def get_audio_files_in_dir(loc:Path)-> List[Path]:
-    audio_extensions = {".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a"}
-    # Get all audio files recursively
-    return sorted([
-        file for file in loc.rglob("*") 
-        if file.is_file() and file.suffix.lower() in audio_extensions
-    ])
-
-def get_speaker_mapping(speakers_dir = Path("./speakers"), use_from_source = False):
-    speaker_mapping = {}
-    if not use_from_source:
-        for spk_cls in speakers_dir.iterdir():
-            if spk_cls.is_dir():
-                speaker_mapping = [(spk_cls.name.lower(), id) for id in get_audio_files_in_dir(spk_cls)]
-    return speaker_mapping
 
 # --------------------------------------------------------------------------
 # Stage 1: extract audio
@@ -178,36 +123,6 @@ def extract_audio(video_path: Path, out_wav: Path, force: bool = False) -> Path:
         str(out_wav),
     ])
     return out_wav
-
-
-# --------------------------------------------------------------------------
-# Stage 2: source separation (Demucs)
-# --------------------------------------------------------------------------
-
-def separate_vocals(stereo_wav: Path, workdir: Path, force: bool = False,
-                     device: str = "cpu", model: str = "htdemucs", demucs: str = "demucs"):
-    out_dir = workdir / "demucs_out"
-    vocals = out_dir / model / stereo_wav.stem / "vocals.wav"
-    background = out_dir / model / stereo_wav.stem / "no_vocals.wav"
-    vocals_16k = workdir / "vocals_16k_mono.wav"
-    if not(vocals.exists() and background.exists() and vocals_16k.exists() and not force):
-        ensure_dir(out_dir)
-        run([sys.executable, "-m", demucs, "-n", model, "--two-stems", "vocals",
-             "-d", device, "-o", str(out_dir), str(stereo_wav)])
-        if not vocals.exists():
-            raise FileNotFoundError(f"Demucs did not produce expected output: {vocals}")
-        # 16kHz mono copy of the *clean* vocal stem -- used for ASR, classifiers,
-        # pitch extraction, and as the cloning reference source (cleaner than
-        # the original mixed audio, since music/fx are stripped out)
-        vocals_16k = workdir / "vocals_16k_mono.wav"
-        if not vocals_16k.exists() or force:
-            run(["ffmpeg", "-y", "-i", str(vocals), "-ac", "1", "-ar", "16000", str(vocals_16k)])
-    # Adjust loudness
-    from pydub import AudioSegment
-    audio = AudioSegment.from_file(vocals_16k)
-    normalized_audio = audio.normalize(headroom=0.3)
-    normalized_audio.export(vocals_16k, format="wav")
-    return vocals, background, vocals_16k, audio.max
 
 # --------------------------------------------------------------------------
 # Stage 3: Voice Activity Detection (Silero VAD) -- NO transcription
@@ -249,91 +164,6 @@ def vad_segment(vocals_wav: Path, workdir: Path, force: bool = False,
 
     log.info("VAD found %d speech segments (no words recognized, timing only)", len(segments))
     cache.write_text(json.dumps([asdict(s) for s in segments], indent=2))
-    return segments
-
-def transcribe_and_diarize(vocals_16k: Path, workdir: Path, force: bool = False,
-                 model_size: str = "large-v3", device: str = "cpu",
-                 diarize: bool = True, hf_token: Optional[str] = None) -> List[Segment]:
-    cache = workdir / "transcript_diarized.json"
-    ref_dir = ensure_dir(workdir / "speaker_refs")
-    if cache.exists() and not force:
-        shutil.copytree(ref_dir, f"./raw_audio/{workdir.name}")
-        data = json.loads(cache.read_text())
-        return [Segment(**s) for s in data]
-
-    import whispermlx
-    asr_options = {
-        "temperatures" : [0.4],
-        "logprob-threshold" : -0.25,
-        #"condition_on_previous_text": False
-    }
-    model = whispermlx.load_model(model_size, device=device, asr_options=asr_options)
-    result = model.transcribe(str(vocals_16k))
-    log.info("Transcribed %d raw segments (language=%s)",
-              len(result.get("segments", [])), result.get("language", "en"))
-
-    # Word-level alignment improves diarization speaker-assignment accuracy
-    try:
-        model_a, metadata = whispermlx.load_align_model(
-            language_code=result.get("language", "en"), device=device
-        )
-        result = whispermlx.align(result["segments"], model_a, metadata, str(vocals_16k), device=device)
-    except Exception as e:
-        log.warning("Word alignment failed (%s); continuing with segment-level timestamps", e)
-
-    if diarize:
-        from whispermlx.diarize import DiarizationPipeline
-        diarize_model = DiarizationPipeline(token=hf_token, device=device)
-        diarize_segments = diarize_model(str(vocals_16k))
-        result = whispermlx.assign_word_speakers(diarize_segments, result)
-
-    from transformers import pipeline
-    gender_model = "alefiury/wav2vec2-large-xlsr-53-gender-recognition-librispeech"
-    gender_classifier = pipeline("audio-classification", model=gender_model) 
-
-    segments: List[Segment] = []
-    
-    audio, sr = sf.read(str(vocals_16k))
-    for i, seg in enumerate(result["segments"]):
-        text = (seg.get("text") or "").strip()
-        if not text:
-            continue
-        speaker = seg.get("speaker")
-        ref_path = ref_dir / f"{speaker}_{i}.wav"
-        if not speaker and seg.get("words"):
-            # fall back to majority vote over this segment's words
-            spk_counts = Counter(w.get("speaker") for w in seg["words"] if w.get("speaker"))
-            speaker = spk_counts.most_common(1)[0][0] if spk_counts else "SPEAKER_00"
-        
-        # Audio clip
-        start_sample = int(seg["start"] * sr)
-        #end_sample = int(min(seg["end"], seg["start"] + 15.0) * sr)
-        end_sample = int(seg["end"] * sr) # needed for complete s2st
-        clip = audio[start_sample:end_sample]
-
-        # Get gender
-        results = gender_classifier(clip)
-        gender = results[0]['label'].lower()
-
-        # Reference voice id
-        try:
-            speaker_id = int(speaker.split('_')[-1])
-        except:
-            speaker_id = -1
-
-        # Write audio
-        sf.write(str(ref_path), clip, sr)
-        # Finalized segment
-        segments.append(Segment(
-            index=i, start=float(seg["start"]), end=float(seg["end"]),
-            speaker=speaker_id, text_en=text,
-            ref_audio_path = str(ref_path), gender=gender
-        ))
-
-    cache.write_text(json.dumps([asdict(s) for s in segments], indent=2))
-    shutil.copytree(ref_dir, f"./raw_audio/{workdir.name}")
-    log.info("Final: %d segments across %d speakers", len(segments),
-              len({s.speaker for s in segments}))
     return segments
 
 # --------------------------------------------------------------------------
@@ -431,13 +261,13 @@ def direct_s2st(vocals_wav: Path, segments: List[Segment], workdir: Path,
     for seg in segments:
         out_path = out_dir / f"seg_{seg.index:04d}.wav"
         if out_path.exists() and not force:
-            seg.s2st_audio_path = str(out_path)
+            seg.gen_audio_path = str(out_path)
             continue
 
         if seg.end - seg.start < 0.05:  # skip slivers under ~50ms
             continue
         elif seg.end - seg.start < 0.4 or len(seg.text_en) < 10: # Keep originals for short clips
-            seg.s2st_audio_path =  seg.ref_audio_path
+            seg.gen_audio_path =  seg.ref_audio_path
         else:
             start_sample = int(seg.start * new_sr)
             end_sample = int(seg.end * new_sr)
@@ -451,7 +281,7 @@ def direct_s2st(vocals_wav: Path, segments: List[Segment], workdir: Path,
 
             waveform = output[0][0].cpu().numpy().squeeze()
             sf.write(str(out_path), waveform, model.config.sampling_rate)
-            seg.s2st_audio_path = str(out_path)
+            seg.gen_audio_path = str(out_path)
 
             log.info("Segment %d: %.2fs -> %.2fs translated (direct S2ST, no text)",
                     seg.index, seg.start, seg.end)
@@ -477,7 +307,7 @@ def voice_style_transfer(segments: List[Segment], workdir: Path, force: bool = F
     # cache target-speaker embeddings per unique reference clip
     target_se_cache = {}
     for seg in segments:
-        if not seg.s2st_audio_path:
+        if not seg.gen_audio_path:
             continue
         out_path = out_dir / f"seg_{seg.index:04d}.wav"
         if out_path.exists() and not force:
@@ -485,7 +315,7 @@ def voice_style_transfer(segments: List[Segment], workdir: Path, force: bool = F
             continue
         if not seg.ref_audio_path:
             log.warning("No speaker reference for segment %d, skipping voice style transfer", seg.index)
-            seg.styled_audio_path = seg.s2st_audio_path
+            seg.styled_audio_path = seg.gen_audio_path
             continue
 
         if seg.ref_audio_path not in target_se_cache:
@@ -493,10 +323,10 @@ def voice_style_transfer(segments: List[Segment], workdir: Path, force: bool = F
             target_se_cache[seg.ref_audio_path] = target_se
         target_se = target_se_cache[seg.ref_audio_path]
 
-        source_se, _ = se_extractor.get_se(seg.s2st_audio_path, converter, vad=False)
+        source_se, _ = se_extractor.get_se(seg.gen_audio_path, converter, vad=False)
 
         converter.convert(
-            audio_src_path=seg.s2st_audio_path,
+            audio_src_path=seg.gen_audio_path,
             src_se=source_se,
             tgt_se=seg.ref_audio_path,
             output_path=str(out_path),
@@ -515,7 +345,7 @@ def voice_style_transfer_chatterbox(segments: List[Segment], workdir: Path,
     )
 
     for seg in segments:
-        if not seg.s2st_audio_path:
+        if not seg.gen_audio_path:
             continue
         out_path = out_dir / f"seg_{seg.index:04d}.wav"
         if out_path.exists() and not force:
@@ -523,17 +353,16 @@ def voice_style_transfer_chatterbox(segments: List[Segment], workdir: Path,
             continue
         if not seg.ref_audio_path:
             log.warning("No speaker reference for segment %d, skipping voice style transfer", seg.index)
-            seg.styled_audio_path = seg.s2st_audio_path
+            seg.styled_audio_path = seg.gen_audio_path
             continue
 
         arr = voice_model.generate(
-            seg.s2st_audio_path,
+            seg.gen_audio_path,
             seg.ref_audio_path
         )
 
         log.info(f"{voice_model.sr} {arr.shape}")
         torchaudio.save(out_path, arr, voice_model.sr)
-        #sf.write(out_path, data=arr.numpy(), samplerate=voice_model.sr)
         seg.styled_audio_path = str(out_path)
     return segments
 
@@ -558,7 +387,7 @@ def align_segments(segments: List[Segment], workdir: Path, force: bool = False,
                     max_stretch: float = 1.6) -> List[Segment]:
     aligned_dir = ensure_dir(workdir / "aligned")
     for seg in segments:
-        source_path = seg.styled_audio_path or seg.s2st_audio_path
+        source_path = seg.styled_audio_path or seg.gen_audio_path
         if not source_path:
             continue
         out_path = aligned_dir / f"seg_{seg.index:04d}.wav"
@@ -576,39 +405,6 @@ def align_segments(segments: List[Segment], workdir: Path, force: bool = False,
             time_stretch(Path(source_path), out_path, factor)
         seg.aligned_audio_path = str(out_path)
     return segments
-
-
-# --------------------------------------------------------------------------
-# Stage 7a: reassemble full track
-# --------------------------------------------------------------------------
-def load_in_stereo(wav, sample_rate):
-    audio, sr = sf.read(wav, dtype="float64")
-    if audio.ndim == 1:
-        audio = np.stack([audio, audio], axis=1)
-    if sr != sample_rate:
-        # resample if needed (XTTS/IndicF5/Parler emit at their own
-        # native rates -- 24kHz for IndicF5, model-specific for Parler)
-        audio = librosa.resample(audio.T, orig_sr=sr, target_sr=sample_rate).T
-    return audio
-
-def build_hindi_vocal_track(segments: List[Segment], total_duration: float,
-                             workdir: Path, sample_rate: int = 48000) -> Path:
-    out_path = workdir / "hindi_vocals_full.wav"
-    canvas = np.zeros((int(total_duration * sample_rate) + sample_rate, 2), dtype=np.float32)
-
-    for seg in segments:
-        if not seg.aligned_audio_path:
-            continue
-        audio = load_in_stereo(seg.aligned_audio_path, sample_rate)
-        start_sample = int(seg.start * sample_rate)
-        end_sample = start_sample + len(audio)
-        if end_sample > canvas.shape[0]:
-            pad = end_sample - canvas.shape[0]
-            canvas = np.pad(canvas, ((0, pad), (0, 0)))
-        canvas[start_sample:end_sample] += audio[:, :2] if audio.shape[1] >= 2 else audio
-
-    sf.write(str(out_path), canvas, sample_rate)
-    return out_path
 
 # --------------------------------------------------------------------------
 # Stage 7b: Vocal output cleaning and volume matching
@@ -699,24 +495,6 @@ def match_envelope(src, ref, sr_src, sr_ref, window_ms=50.0, hop_ms=10.0,
         out = out * (0.999 / peak)
     return out
 
-def normalize_new_vocals(hindi_vocals_wav: Path, vocals_wav: Path, workdir: Path, 
-                        demucs = "demucs", demucs_model="htdemucs", device="cpu", sample_rate: int = 48000) -> Path:
-    # Denoise
-    out_dir = workdir / "hindi_demucs_out"
-    ensure_dir(out_dir)
-    run([demucs, "-n", demucs_model, "--two-stems=vocals", "-o", str(out_dir), str(hindi_vocals_wav)])
-
-    # Adjust volume to match original vocals by windowing and scaling
-    new_vocals_wav = out_dir / "htdemucs" / "hindi_vocals_full" / "vocals.wav"
-    src = load_in_stereo(str(new_vocals_wav), sample_rate)
-    ref = load_in_stereo(vocals_wav, sample_rate)
-    out = match_envelope(src, ref, sample_rate, sample_rate)
-
-    normalized_wav = workdir / "hindi_vocals_normalized.wav"
-    sf.write(str(normalized_wav), out, sample_rate)
-
-    return normalized_wav
-
 # --------------------------------------------------------------------------
 # Stage 7c: reassemble full track, loudness-match, mix with background
 # --------------------------------------------------------------------------
@@ -736,37 +514,6 @@ def loudness_match_and_mix(hindi_vocals: Path, vocals_wav:Path, background: Path
         str(mixed),
     ])
     return mixed
-
-
-# --------------------------------------------------------------------------
-# Stage 8: mux into the video as an additional audio track
-# --------------------------------------------------------------------------
-
-def mux_into_video(video_path: Path, hindi_track: Path, output_path: Path):
-    run([
-        "ffmpeg", "-y",
-        "-i", str(video_path),
-        "-i", str(hindi_track),
-        "-map", "0:v", "-map", "0:a", "-map", "1:a",
-        "-c:v", "copy",
-        "-c:a:0", "copy",
-        "-c:a:1", "aac", "-b:a:1", "192k",
-        "-metadata:s:a:0", "language=eng",
-        "-metadata:s:a:1", "language=hin",
-        "-metadata:s:a:1", "title=Hindi (AI Dubbed, direct S2ST)",
-        "-disposition:a:0", "default",
-        "-disposition:a:1", "0",
-        str(output_path),
-    ])
-
-
-def get_media_duration(path: Path) -> float:
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-        check=True, capture_output=True, text=True,
-    )
-    return float(result.stdout.strip())
 
 
 # --------------------------------------------------------------------------
@@ -836,14 +583,14 @@ def main():
                                                 checkpoint_dir=args.openvoice_checkpoints)
     else:
         for seg in segments:
-            seg.styled_audio_path = seg.s2st_audio_path
+            seg.styled_audio_path = seg.gen_audio_path
 
     # 6. align to original timing
     segments = align_segments(segments, workdir, force=args.force)
 
     # 7. reassemble + mix
     total_duration = get_media_duration(args.input)
-    hindi_vocals_full = build_hindi_vocal_track(segments, total_duration, workdir)
+    hindi_vocals_full = build_target_vocal_track(segments, total_duration, workdir)
     final_hindi_track = loudness_match_and_mix(hindi_vocals_full, vocals_wav, background_wav, workdir, args.device)
 
     # 8. mux into video
