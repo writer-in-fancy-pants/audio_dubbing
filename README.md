@@ -1,7 +1,17 @@
 # Experimental Modular Voice Dubbing for Shows & Movies
 An End-to-end voice dubbing tool. For a chosen video, the tool translates the audio track, using 
   - Speech transcription -> translation -> text-to speech
+    - Matches content well
+    - Sarcasm, jokes, proverbs may be lost in translation
+    - Sometimes speaker recognition fails, causing voice mismatch
+    - Slower
+    - Recommended for dubbing into indic languages
   - Speech to speech translation -> Voice style transfer / voice cloning
+    - Better captures natural speech
+    - Translation not so good, often incomplete
+    - Sometimes speaker recognition fails, causing voice mismatch
+    - Faster
+    - **Default recommendation**, try the other pipeline if this fails
 
 **PLEASE NOTE** : I will not be uploading any speech clips, for privacy and as a good practice.
 Please acquire speech clips and place them in speakers/male and speakers/female directories. 
@@ -10,6 +20,7 @@ to use voices of the speakers already in the voice models used.
 
 The requirements are intentionally incomplete. What's provided works, while the other options need
 understanding what you are doing. You can also add finetuned models yourselves, for your hardware.
+
 
 ## Current Features (v0)
 - VAD, whisper mlx, diarization
@@ -26,6 +37,9 @@ understanding what you are doing. You can also add finetuned models yourselves, 
 - English to Hindi dubbing
 - Run script with presets
 - Voxtral TTS support
+- Fixed aligned, voice loudness normalization
+- Added missing audio files
+- Pitch median, iqr based reference audio selection
 
 ## In Progress
 - Voice LORA support

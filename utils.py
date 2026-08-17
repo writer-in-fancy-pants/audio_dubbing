@@ -96,6 +96,7 @@ class Segment:
     dominance: Optional[float] = None
 
     pitch_hz: Optional[float] = None
+    pitch_var: Optional[float] = None      # variance in pitch, used to detect anomalous clips
     speed_wps: Optional[float] = None      # words per second
     volume: Optional[float] = None
     volume_out: Optional[float] = None
@@ -431,24 +432,43 @@ def get_closest_long_clip(segments:List[Segment], speech_time = 3.0):
 
 # Voice clone profiles
 def build_speaker_ref_profiles(segments: List[Segment], workdir: Path, 
-                thresh = 4.0, max_audios =6, max_thresh = 8.0):
+                thresh = 4.0, max_thresh = 10.0, max_audios =6, 
+                pitch_match=True, pitch_variance_threshold = 10.0):
     from heapq import heappush, heappop
-    speakers = defaultdict(list)
+    speakers = defaultdict(list)    # speaker references
+    pitch_var = defaultdict(float)  # pitch variance per speaker
     for seg in segments:
         dur = seg.end - seg.start
-        if thresh < dur:
-            heappush(speakers[seg.speaker], (dur, seg.pitch_hz, seg.ref_audio_path))
+        # NOTE : This logic breaks if default pitch_hz > 20, hope you know what you are doing
+        if thresh < dur and seg.pitch_hz > 20.0:
+            pitch_var[seg.speaker] += seg.pitch_var
+            if pitch_match:
+                # change to seg.ref_audio_path if using external
+                heappush(speakers[seg.speaker], (dur, seg.pitch_hz, seg.pitch_var, seg.audio_path))
+            else:
+                # Use low variance speech instead
+                heappush(speakers[seg.speaker], (dur, seg.pitch_var, seg.pitch_hz, seg.audio_path))
             if len(speakers[seg.speaker]) >max_audios:
                 heappop(speakers[seg.speaker])
+    
+    # pitch_var = {k: v/len(speakers[k]) for k,v in pitch_var.items()}
+    # # Find best audio - closest to average pitch variance / minimum pitch variation
+    # if not pitch_match:
+    #     best_audio = {k: find_closest(v, pitch_var[k], idx=2)[-1] for k,v in speakers.items()}
+    #     print(best_audio)
+    #     #best_audio = {k: find_closest(v, 10, idx=2)[-1] for k,v in speakers}
 
     for seg in segments:
-        if seg.end - seg.start > thresh:
+        if seg.end - seg.start > thresh and seg.pitch_var < pitch_variance_threshold:
+            # use original audio if long enough
             seg.ref_audio_path = seg.audio_path
         elif len(speakers[seg.speaker]) > 0:
+            # use one of the longer audios with closest pitch
             seg.ref_audio_path = find_closest(speakers[seg.speaker], seg.pitch_hz, idx=1)[-1]
         else:
             # don't generate this person whose voice is not available at all
             seg.gen_audio_path = seg.audio_path
+            seg.ref_audio_path = None
 
     (workdir / "speaker_profiles.json").write_text(
         json.dumps({k: v for k, v in speakers.items()}, indent=2, ensure_ascii=False)
@@ -941,9 +961,9 @@ def classify_emotion(segments: List[Segment], vocals_16k: Path, workdir: Path,
     cache.write_text(json.dumps(results, indent=2))
     return segments
 
-def extract_pitch_and_speed(segments: List[Segment], vocals_16k: Path) -> List[Segment]:
-
+def extract_pitch_and_speed(segments: List[Segment], vocals_16k: Path, pitch_default = 0.0) -> List[Segment]:
     audio, sr = sf.read(str(vocals_16k))
+    
     for seg in segments:
         chunk = audio[int(seg.start * sr):int(seg.end * sr)]
         duration = max(seg.end - seg.start, 0.01)
@@ -958,16 +978,57 @@ def extract_pitch_and_speed(segments: List[Segment], vocals_16k: Path) -> List[S
             )
             voiced_f0 = f0[voiced_flag] if voiced_flag is not None else f0[~np.isnan(f0)]
             voiced_f0 = voiced_f0[~np.isnan(voiced_f0)] if voiced_f0 is not None else []
-            seg.pitch_hz = float(np.median(voiced_f0)) if len(voiced_f0) else 130.0
+            seg.pitch_hz = float(np.median(voiced_f0)) if len(voiced_f0) else pitch_default
+            # seg.pitch_var = float(np.var(voiced_f0)) if len(voiced_f0) else 10000.0
+            # Actually iqr/2, not variance
+            seg.pitch_var  = float(np.subtract(*np.percentile(voiced_f0, [75, 25])))/2 if len(voiced_f0) else 10000.0
         except Exception as e:
             log.warning("pyin failed on segment %d (%s); defaulting pitch", seg.index, e)
-            seg.pitch_hz = 130.0
+            seg.pitch_hz = pitch_default
+            seg.pitch_var = 10000.0
 
         # gender heuristic fallback, only used if gender wasn't classified
         if seg.gender is None:
             seg.gender = "female" if seg.pitch_hz > 175 else "male"
     return segments
 
+
+# --------------------------------------------------------------------------
+# Stage 8: time-align each clip to its original slot, with crossfades
+# --------------------------------------------------------------------------
+def voice_style_transfer_chatterbox(segments: List[Segment], workdir: Path, 
+                force: bool = False, device: str = "cpu") -> List[Segment]:
+    from chatterbox.vc import ChatterboxVC
+    import torchaudio
+    out_dir = ensure_dir(workdir / "voice_styled")
+    voice_model = ChatterboxVC.from_pretrained(
+        device=device,
+    )
+
+    for seg in segments:
+        out_path = out_dir / f"seg_{seg.index:04d}.wav"
+        if out_path.exists() and not force:
+            seg.styled_audio_path = str(out_path)
+            continue
+        # No reference
+        if not seg.ref_audio_path:
+            log.warning("No speaker reference for segment %d, skipping voice style transfer", seg.index)
+            seg.styled_audio_path = seg.gen_audio_path
+            continue
+        # Original audio, no style transfer needed
+        if not seg.gen_audio_path or seg.gen_audio_path == seg.audio_path:
+            seg.styled_audio_path = seg.audio_path
+            continue
+
+        arr = voice_model.generate(
+            seg.gen_audio_path,
+            seg.ref_audio_path
+        )
+
+        log.info(f"{voice_model.sr} {arr.shape}")
+        torchaudio.save(out_path, arr, voice_model.sr)
+        seg.styled_audio_path = str(out_path)
+    return segments
 
 # --------------------------------------------------------------------------
 # Stage 8: time-align each clip to its original slot, with crossfades

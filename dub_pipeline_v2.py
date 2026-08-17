@@ -154,10 +154,9 @@ from utils import (
     extract_embedded_subtitles, read_subs_as_whisper_segments,
     separate_vocals, slowdown,
     transcribe_and_diarize, subs_and_diarize, subs_only_transcription,
-    build_clap_profiles,
-    check_dont_generate, classify_emotion,
+    build_clap_profiles, check_dont_generate, classify_emotion,
     extract_pitch_and_speed, get_closest_long_clip, build_speaker_ref_profiles,
-    align_segments, get_media_duration,
+    voice_style_transfer_chatterbox, align_segments, get_media_duration,
     build_target_vocal_track, loudness_match_and_mix, mux_into_video
 )
 
@@ -556,44 +555,6 @@ def synth_chatterbox(segments:List[Segment], workdir:Path,
         torchaudio.save(seg.gen_audio_path, arr, multilingual_model.sr)
     return segments
 
-
-def voice_style_transfer_chatterbox(segments: List[Segment], workdir: Path,
-                tgt_lang:str = 'hi', force: bool = False, device: str = "cpu") -> List[Segment]:
-    # 24000 hz
-    from chatterbox.vc import ChatterboxVC
-    import torchaudio
-    out_dir = ensure_dir(workdir / "voice_styled")
-    voice_model = ChatterboxVC.from_pretrained(
-        device=device,
-    )
-
-    for seg in segments:
-        out_path = out_dir / f"seg_{seg.index:04d}.wav"
-        if out_path.exists() and not force:
-            seg.gen_audio_path = str(out_path)
-            continue
-
-        if check_dont_generate(seg, 0.7, 2):
-            if not seg.gen_audio_path:
-                seg.gen_audio_path = seg.audio_path
-            continue
-
-        # Using english audio to voice clone if no references
-        if not seg.ref_audio_path:
-            continue
-        print(seg.text_in, seg.text_out, seg.gen_audio_path)
-        arr = voice_model.generate(
-            seg.gen_audio_path,
-            seg.ref_audio_path
-        )
-        
-        log.info(f"{voice_model.sr} {arr.shape}")
-        torchaudio.save(str(out_path), arr, voice_model.sr)
-        # Note variable reset to styled wav
-        seg.styled_audio_path = str(out_path)
-        
-    return segments
-
 # --------------------------------------------------------------------------
 # Stage 7e: TTS Method D -- Voxtral (Zero shot)
 # --------------------------------------------------------------------------
@@ -766,7 +727,7 @@ def main():
             segments = synth_chatterbox(segments, workdir,tgt_lang=args.target_lang, force=args.force, device=device)
 
     if not args.no_voice_styling:
-        segments = voice_style_transfer_chatterbox(segments, workdir, tgt_lang=args.target_lang,  force=args.force, device="cpu")
+        segments = voice_style_transfer_chatterbox(segments, workdir, force=args.force, device='cpu') # Mac kernel panic on mps
 
     segments = align_segments(segments, workdir, force=args.force, max_stretch=args.max_stretch)
 

@@ -101,6 +101,7 @@ from utils import (
     separate_vocals,
     transcribe_and_diarize, get_media_duration,
     build_clone_references, extract_pitch_and_speed,
+    voice_style_transfer_chatterbox,
     align_segments, build_target_vocal_track, 
     loudness_match_and_mix, mux_into_video
 )
@@ -293,40 +294,6 @@ def voice_style_transfer(segments: List[Segment], workdir: Path, force: bool = F
 
     return segments
 
-def voice_style_transfer_chatterbox(segments: List[Segment], workdir: Path, 
-                force: bool = False, device: str = "cpu") -> List[Segment]:
-    from chatterbox.vc import ChatterboxVC
-    import torchaudio
-    out_dir = ensure_dir(workdir / "voice_styled")
-    voice_model = ChatterboxVC.from_pretrained(
-        device=device,
-    )
-
-    for seg in segments:
-        out_path = out_dir / f"seg_{seg.index:04d}.wav"
-        if out_path.exists() and not force:
-            seg.styled_audio_path = str(out_path)
-            continue
-        # No reference
-        if not seg.ref_audio_path:
-            log.warning("No speaker reference for segment %d, skipping voice style transfer", seg.index)
-            seg.styled_audio_path = seg.gen_audio_path
-            continue
-        # Original audio, no style transfer needed
-        if not seg.gen_audio_path or seg.gen_audio_path == seg.audio_path:
-            seg.styled_audio_path = seg.audio_path
-            continue
-
-        arr = voice_model.generate(
-            seg.gen_audio_path,
-            seg.ref_audio_path
-        )
-
-        log.info(f"{voice_model.sr} {arr.shape}")
-        torchaudio.save(out_path, arr, voice_model.sr)
-        seg.styled_audio_path = str(out_path)
-    return segments
-
 
 # --------------------------------------------------------------------------
 # Orchestration
@@ -395,13 +362,10 @@ def main():
             segments = build_speaker_reference(segments, spk_map)
 
         if args.vc == "chatterbox":
-            segments = voice_style_transfer_chatterbox(segments, workdir, force=args.force, device=args.device)
+            segments = voice_style_transfer_chatterbox(segments, workdir, force=args.force, device='cpu') # Mac kernel panic on mps
         else:
             segments = voice_style_transfer(segments, workdir, force=args.force, device=args.device,
                                                 checkpoint_dir=args.openvoice_checkpoints)
-    # else:
-    #     for seg in segments:
-    #         seg.styled_audio_path = seg.gen_audio_path
 
     # 6. align to original timing
     segments = align_segments(segments, workdir, force=args.force)
