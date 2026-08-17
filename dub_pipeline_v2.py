@@ -157,7 +157,7 @@ from utils import (
     build_clap_profiles,
     check_dont_generate, classify_emotion,
     extract_pitch_and_speed, get_closest_long_clip, build_speaker_ref_profiles,
-    align_segments, normalize_new_vocals, get_media_duration,
+    align_segments, get_media_duration,
     build_target_vocal_track, loudness_match_and_mix, mux_into_video
 )
 
@@ -765,17 +765,15 @@ def main():
         else:
             segments = synth_chatterbox(segments, workdir,tgt_lang=args.target_lang, force=args.force, device=device)
 
-    if not args.no_voice_stying:
+    if not args.no_voice_styling:
         segments = voice_style_transfer_chatterbox(segments, workdir, tgt_lang=args.target_lang,  force=args.force, device="cpu")
 
     segments = align_segments(segments, workdir, force=args.force, max_stretch=args.max_stretch)
 
     total_duration = get_media_duration(args.input)
-    target_vocals_full = build_target_vocal_track(segments, vocals_wav, total_duration, workdir)
-    target_vocals_normalized = normalize_new_vocals(target_vocals_full, vocals_wav, workdir)
-    # target_final_track = scale_vocal_background(vocals_wav, background_wav, stereo_wav, target_vocals_normalized, workdir, 
-    #                                            total_duration, sr=48000)
-    target_final_track = loudness_match_and_mix(target_vocals_normalized, background_wav, workdir)
+    target_vocals_full = build_target_vocal_track(segments, total_duration, workdir)
+    # target_vocals_normalized = normalize_new_vocals(target_vocals_full, vocals_wav, workdir)
+    target_final_track = loudness_match_and_mix(target_vocals_full, background_wav, workdir)
 
     mux_into_video(args.input, target_final_track, args.output)
     log.info("Done. Output: %s", args.output.resolve())

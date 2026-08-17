@@ -10,7 +10,6 @@ import librosa
 import soundfile as sf
 import numpy as np
 
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -62,6 +61,11 @@ lang_ref ={
     'hi':['hin', "hin_Deva", 'hi', 'hindi']
 }
 
+seamless_speakers = {
+    'male': [30, 32, 33, 36, 40, 41, 42, 1,4,5,8,12,19,24,25,26,27,29],
+    'female': [31,34,35,0,2,3,6,7,9,10,11,13,14,15,16,17,18,20,21,22,23,28]
+}
+
 # --------------------------------------------------------------------------
 # Data model
 # --------------------------------------------------------------------------
@@ -91,9 +95,10 @@ class Segment:
     valence: Optional[float] = None
     dominance: Optional[float] = None
 
-    age_years: Optional[int] = None
     pitch_hz: Optional[float] = None
     speed_wps: Optional[float] = None      # words per second
+    volume: Optional[float] = None
+    volume_out: Optional[float] = None
 
     audio_path: Optional[str] = None   # this segment's own clean EN clip (Method B)
     ref_audio_path: Optional[str] = None   # in case multiple tts engines are used before voice cloning
@@ -676,7 +681,7 @@ def subs_only_transcription(vocals_16k: Path, workdir: Path, segments, force: bo
             speaker=None, 
             text_in=seg.get("text_in", ""),
             text_out=seg.get("text_out", None),
-            audio_path = str(ref_path), ref_audio_path = str(ref_path),
+            audio_path = str(ref_path),
             gender=gender_classifier(clip)[0]['label']
         )
         sf.write(new_seg.audio_path, clip, sr)
@@ -719,7 +724,7 @@ def subs_and_diarize(vocals_16k: Path, workdir: Path, segments, force: bool = Fa
             speaker=spk or "SPEAKER_00", 
             text_in=segments[i].get("text_in", ""),
             text_out=segments[i].get("text_out", ""),
-            audio_path = str(ref_path), gender="Male"
+            audio_path = str(ref_path), gender="male"
         )
 
         start_sample = int(turn.start * sr)
@@ -972,13 +977,13 @@ def get_duration(wav_path: Path) -> float:
     info = sf.info(str(wav_path))
     return info.frames / info.samplerate
 
-def time_stretch(in_path: Path, out_path: Path, factor: float, min_stretch:float=0.7):
-    factor = max(min_stretch, factor)
-    run(["ffmpeg", "-y", "-i", str(in_path), "-filter:a", f"atempo={factor:.4f}", str(out_path)])
+def time_stretch(in_path: Path, out_path: Path, tempo_filter:List[str], volume_filter:List[str]):
+    run(["ffmpeg", "-y", "-i", str(in_path)] + tempo_filter + volume_filter +[str(out_path)])
 
 
 def align_segments(segments: List[Segment], workdir: Path, force: bool = False,
-                    max_stretch: float = 1.5) -> List[Segment]:
+                min_stretch=0.7, max_stretch: float = 1.5) -> List[Segment]:
+    from pydub import AudioSegment
     aligned_dir = ensure_dir(workdir / "aligned")
     for seg in segments:
         log.info(f"Creating {seg.index} : {seg.styled_audio_path}, {seg.aligned_audio_path}")
@@ -999,13 +1004,29 @@ def align_segments(segments: List[Segment], workdir: Path, force: bool = False,
         target_dur = max(seg.end - seg.start, 0.1)
         actual_dur = get_duration(Path(seg.styled_audio_path))
         factor = actual_dur / target_dur
-        factor = max(1.0 / max_stretch, min(factor, max_stretch))
-        if abs(factor - 1.0) < 0.03:
-            seg.aligned_audio_path = seg.styled_audio_path
-        else:
-            # Speed up or slow down a little, not completely
-            time_stretch(Path(seg.styled_audio_path), out_path, np.sqrt(factor)) 
-            seg.aligned_audio_path = str(out_path)
+
+        # Default audio
+        seg.aligned_audio_path = seg.styled_audio_path
+        volume_filter = []
+        tempo_filter = []
+
+        # Process and align audio if generated
+        if seg.styled_audio_path != seg.audio_path:
+            # Volume adjustment
+            v1 = AudioSegment.from_file(seg.audio_path).dBFS
+            v2 = AudioSegment.from_file(seg.styled_audio_path).dBFS
+            if abs(v2-v1) > 1.0:
+                volume_filter = ["-filter:a", f"volume={v1-v2}dB"]
+
+            # Tempo adjustment
+            if abs(factor - 1.0) > 0.03:
+                factor = np.sqrt(factor)
+                factor = max(min_stretch, min(factor, max_stretch))
+                tempo_filter = ["-filter:a", f"atempo={factor:.4f}"]
+
+            if not (volume_filter == [] and tempo_filter == []):
+                time_stretch(Path(seg.styled_audio_path), out_path, tempo_filter, volume_filter)
+                seg.aligned_audio_path = str(out_path)
     return segments
 
 
@@ -1013,7 +1034,7 @@ def align_segments(segments: List[Segment], workdir: Path, force: bool = False,
 # Stage 9: reassemble (with short crossfades), loudness-match, mix
 # --------------------------------------------------------------------------
 
-def build_target_vocal_track(segments: List[Segment], vocals:Path, total_duration: float, workdir: Path,
+def build_target_vocal_track(segments: List[Segment], total_duration: float, workdir: Path,
                               sample_rate: int = 48000, fade_ms: float = 10.0) -> Path:
     out_path = workdir / "target_vocals_full.wav"
     canvas = np.zeros((int(total_duration * sample_rate) + sample_rate, 2), dtype=np.float64)
@@ -1049,8 +1070,8 @@ def build_target_vocal_track(segments: List[Segment], vocals:Path, total_duratio
 
 
 def loudness_match_and_mix(target_vocals: Path, background: Path, workdir: Path) -> Path:
-    # normalized = workdir / "target_vocals_final.wav"
-    # run(["ffmpeg", "-y", "-i", str(target_vocals), "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11", str(normalized)])
+    normalized = workdir / "target_vocals_final.wav"
+    run(["ffmpeg", "-y", "-i", str(target_vocals), "-af", f"loudnorm=I=-16:TP=-1.5:LRA=11", str(normalized)])
     mixed = workdir / "target_final_track.wav"
     run(["ffmpeg", "-y", "-i", str(target_vocals), "-i", str(background),
          "-filter_complex", "[0:a][1:a]amix=inputs=2:duration=longest:normalize=0", str(mixed)])
